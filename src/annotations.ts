@@ -38,10 +38,24 @@ function fail(code: string, detail: string): ValidationError {
   return { ok: false, code, detail };
 }
 
-export function normalizeBody(raw: unknown, maxChars: number): Validation<string> {
+/**
+ * 正文校验。
+ *
+ * `allowEmpty` 只对批注自身的 body 开:智能高亮的产出就是「一段被划了线的话」,
+ * 那本来就是一个完整的批注,强制写文字会让「采纳建议」变成「必须写点什么」,
+ * 与这个功能的用意相反。**回复仍然不许为空**(回复没有内容就没有意义)。
+ */
+export function normalizeBody(
+  raw: unknown,
+  maxChars: number,
+  allowEmpty = false,
+): Validation<string> {
   if (typeof raw !== 'string') return fail('invalid_body', 'body 必须是字符串');
   const body = raw.trim();
-  if (body.length === 0) return fail('invalid_body', '批注正文不能为空');
+  if (body.length === 0) {
+    if (allowEmpty) return { ok: true, value: '' };
+    return fail('invalid_body', '批注正文不能为空');
+  }
   if (body.length > maxChars) return fail('invalid_body', `批注正文超过 ${maxChars} 字上限`);
   // 控制字符(除换行/制表)一律剔除:防用不可见字符构造混淆内容
   const cleaned = body.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');

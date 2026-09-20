@@ -542,7 +542,8 @@ async function suiteAnnotations(): Promise<void> {
 
   await test('输入校验:正文长度、可见性、色板 id、selector', () => {
     eq(normalizeBody('  hi  ', 10).ok, true, '正常正文');
-    ok(!normalizeBody('', 10).ok, '空正文拒绝');
+    ok(!normalizeBody('', 10).ok, '回复的空正文拒绝');
+    ok(normalizeBody('', 10, true).ok, '批注自身的空正文合法(纯高亮没有文字)');
     ok(!normalizeBody('x'.repeat(11), 10).ok, '超长拒绝');
     const cleaned = normalizeBody('a\u0000b', 10);
     ok(cleaned.ok && cleaned.value === 'ab', '控制字符剔除');
@@ -1230,6 +1231,30 @@ async function suiteHttpAuth(): Promise<void> {
         token: alice.token,
       });
       eq(after.status, 401, '登出后不能再读写');
+    });
+
+    await test('纯高亮(空正文)可以创建;回复的空正文仍然被拒', async () => {
+      const alice = await loginAs(h, 'code-alice');
+      const created = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '',
+          color: 'yellow',
+          visibility: 'private',
+          target: { selectors: [{ type: 'TextQuoteSelector', exact: '纯高亮' }] },
+        }),
+      });
+      eq(created.status, 201, '空正文的批注应可创建');
+      eq(created.body.annotation.body, '', '正文就是空串');
+      const reply = await api(h, `/api/annotations/${created.body.annotation.id}`, {
+        method: 'PATCH',
+        token: alice.token,
+        body: JSON.stringify({ replies: [{ body: '   ' }] }),
+      });
+      eq(reply.status, 400, '回复的空正文必须被拒');
+      eq(reply.body.error, 'invalid_body', '错误码');
     });
 
     await test('导出:只含公开 + 本人私有', async () => {

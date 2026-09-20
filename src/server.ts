@@ -54,7 +54,8 @@ import type { HighlightRequest } from './highlight/index.ts';
 
 const CreateAnnotationSchema = z.object({
   page: z.string().min(1).max(512),
-  body: z.string().min(1),
+  // 空正文合法:纯高亮没有文字(见 normalizeBody 的 allowEmpty)
+  body: z.string().max(20_000),
   color: z.string().min(1).max(32),
   visibility: z.string(),
   target: z.object({ selectors: z.array(z.unknown()).min(1) }).passthrough(),
@@ -320,7 +321,8 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, 'invalid_page', 'page 必须是本站路径', cors);
       return;
     }
-    const body = normalizeBody(parsed.data.body, config.maxBodyChars);
+    // allowEmpty:纯高亮(没有文字)是合法批注 —— 智能高亮的产出就是这个形态
+    const body = normalizeBody(parsed.data.body, config.maxBodyChars, true);
     if (!body.ok) {
       sendError(req, res, 400, body.code, body.detail, cors);
       return;
@@ -403,7 +405,7 @@ export function createApp(deps: ServerDeps) {
 
     const next: AnnotationRecord = { ...record };
     if (parsed.data.body !== undefined) {
-      const body = normalizeBody(parsed.data.body, config.maxBodyChars);
+      const body = normalizeBody(parsed.data.body, config.maxBodyChars, true);
       if (!body.ok) {
         sendError(req, res, 400, body.code, body.detail, cors);
         return;
