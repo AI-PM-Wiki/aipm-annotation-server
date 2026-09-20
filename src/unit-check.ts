@@ -1352,6 +1352,28 @@ async function suiteHttpAuth(): Promise<void> {
       eq(reply.body.error, 'invalid_body', '错误码');
     });
 
+    await test('dev 登录端点带 CORS(本地联调要从页面里换会话)', async () => {
+      // 默认 harness 没开 DEV_AUTH_BYPASS(见「DEV_AUTH_BYPASS 关闭时 /api/auth/dev
+      // 不存在」那条),这里单起一个开着的
+      const h2 = await makeHarness({ DEV_AUTH_BYPASS: 'true' });
+      try {
+        const res = await api(h2, '/api/auth/dev', {
+          method: 'POST',
+          headers: { Origin: 'https://aipm.ac' },
+        });
+        eq(res.status, 200, 'DEV_AUTH_BYPASS 开启时可用');
+        eq(res.headers.get('access-control-allow-origin'), 'https://aipm.ac', '反射白名单 Origin');
+        ok(typeof res.body?.token === 'string', '回会话 token');
+        const outside = await api(h2, '/api/auth/dev', {
+          method: 'POST',
+          headers: { Origin: 'https://evil.example' },
+        });
+        eq(outside.headers.get('access-control-allow-origin'), null, '白名单外不反射');
+      } finally {
+        await h2.close();
+      }
+    });
+
     await test('CORS 暴露 Retry-After(否则前端读不到真实冷却窗口)', async () => {
       // 跨源 fetch 只能看到 safelisted 响应头,Retry-After 不在其中;不显式
       // Access-Control-Expose-Headers 的话,前端 429 后只能退化成写死的秒数,

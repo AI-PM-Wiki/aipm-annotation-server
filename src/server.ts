@@ -679,8 +679,11 @@ export function createApp(deps: ServerDeps) {
         sendError(req, res, 404, 'not_found', 'Not Found', { Vary: 'Origin' });
         return;
       }
+      // 带上 CORS 头:本地联调时前端要从**页面里**调它换会话(真实 OAuth 要注册
+      // App + 隧道,本地跑不起来)。只反射 ALLOWED_ORIGINS 里的 origin —— 别的站点
+      // 依旧拿不到响应,而能直连回环的人本来就能用 curl 拿到同一个会话。
       const session = auth.devLogin();
-      void store.flush().then(() => writeJson(res, 200, session, { Vary: 'Origin' }));
+      void store.flush().then(() => writeJson(res, 200, session, cors));
       return;
     }
 

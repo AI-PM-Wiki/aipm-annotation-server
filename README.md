@@ -145,6 +145,24 @@ npm run dev           # tsx 直跑,读 .env
 
 `/healthz` 会返回索引状态、批注/会话条数、并发水位,以及判分路由与当日预算水位。
 
+## 本地联调
+
+```bash
+# 站点自己起(任意端口,记得加进 ALLOWED_ORIGINS)
+uv run mkdocs serve -a 127.0.0.1:8010
+# .env 里:HOST=127.0.0.1、DEV_AUTH_BYPASS=true、ALLOWED_ORIGINS 含站点 origin
+npm start
+```
+
+浏览器控制台里换一个会话(不用注册 GitHub OAuth App):
+
+```js
+await fetch('http://127.0.0.1:8788/api/auth/dev', { method: 'POST' })
+  .then(r => r.json()).then(d => { localStorage.setItem('aipm-anno-auth', JSON.stringify(d)); location.reload() });
+```
+
+登出:`localStorage.removeItem('aipm-anno-auth')`。
+
 ## 已知限制
 
 - 单实例:预算与调用次数计数是**进程内**状态,重启清零;多实例需要换共享存储。
@@ -155,9 +173,8 @@ npm run dev           # tsx 直跑,读 .env
   hypothes.is 历史数据迁移(只提供兼容导出)。
 - `MODERATOR_LOGINS` 只能删**公开**批注,看不到也不动私有批注 —— 版主权限不越
   隐私边界。
-- `/api/auth/dev`(仅回环 + `DEV_AUTH_BYPASS` 时存在)与 `/healthz` 不带 CORS 头,
-  所以**不能从页面里用 fetch 调**;`devLogin` 返回的会话要自己放进 localStorage
-  才能让前端认。真实登录走 `/api/auth/github/start` 的整页跳转,不受影响。
+- `/healthz` 是监控端点,刻意不带 CORS 头(它是给探测用的,不该被页面脚本读)。
+  真实登录走 `/api/auth/github/start` 的整页跳转,不受影响。
 - 智能高亮的同页缓存 key 是「页面 + 正文哈希 + judge + 色板版本」。页面正文没变
   时同页各客户端共享缓存;前端给块的 id 取「文档里的位置序号」而非「入选块序号」,
   各客户端的 id↔段落映射因此一致,缓存结果不会被错配到别的段落上。
