@@ -913,6 +913,101 @@ async function suiteLlm(): Promise<void> {
     ok((err as JudgeError).usage?.inputTokens === 10, '失败也带走已产生的用量');
   });
 
+  await test('首次调用直接抛错(不是返回空结果)→ 仍然重试一次并成功', async () => {
+    // 端到端跑出来的坑:模型整段输出不是合法 JSON 时,SDK 的结构化输出解析器是
+    // **抛错**而不是回 parsed_output:null —— 只重试「解析出来但没建议」的分支
+    // 会漏掉这类最常见的失败,该片就白白 degrade 了。
+    let calls = 0;
+    const judge = new LlmJudge({
+      apiKey: 'sk',
+      model: 'claude-haiku-4-5',
+      maxTokens: 1000,
+      timeoutMs: 5_000,
+      inputCostPerMtok: 1,
+      outputCostPerMtok: 5,
+      caller: async (params) => {
+        calls++;
+        if (calls === 1) throw new Error('Failed to parse structured output as JSON: x');
+        ok(params.user.includes('上一次'), '重试提示应回灌错误');
+        return {
+          parsed: { results: [{ id: 'b1', worth: 0.8, color: 'yellow', importance: 2 }] },
+          usage: { inputTokens: 10, outputTokens: 2 },
+        };
+      },
+    });
+    const outcome = await judge.judge({
+      page: PAGE,
+      title: 't',
+      palette: PALETTE,
+      chunk: { index: 0, blocks: [{ id: 'b1', text: 'x' }] },
+      totalChunks: 1,
+    });
+    eq(calls, 2, '首次抛错后重试一次');
+    eq(outcome.suggestions.length, 1, '第二次拿到结果');
+  });
+
+  await test('两次都抛错 → 上抛带原因的错(不是笼统的 shape)', async () => {
+    let calls = 0;
+    const judge = new LlmJudge({
+      apiKey: 'sk',
+      model: 'claude-haiku-4-5',
+      maxTokens: 1000,
+      timeoutMs: 5_000,
+      inputCostPerMtok: 1,
+      outputCostPerMtok: 5,
+      caller: async () => {
+        calls++;
+        throw new Error('Failed to parse structured output as JSON: boom');
+      },
+    });
+    const err = await judge
+      .judge({
+        page: PAGE,
+        title: 't',
+        palette: PALETTE,
+        chunk: { index: 0, blocks: [{ id: 'b1', text: 'x' }] },
+        totalChunks: 1,
+      })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    eq(calls, 2, '两次都调了');
+    ok(err instanceof JudgeError && (err as JudgeError).code === 'shape', '结构化输出解析失败归 shape');
+  });
+
+  await test('限流不重试(立刻重发只会再撞同一堵墙)', async () => {
+    let calls = 0;
+    const judge = new LlmJudge({
+      apiKey: 'sk',
+      model: 'claude-haiku-4-5',
+      maxTokens: 1000,
+      timeoutMs: 5_000,
+      inputCostPerMtok: 1,
+      outputCostPerMtok: 5,
+      caller: async () => {
+        calls++;
+        const err = new Error('rate limited') as Error & { status: number };
+        err.status = 429;
+        throw err;
+      },
+    });
+    const err = await judge
+      .judge({
+        page: PAGE,
+        title: 't',
+        palette: PALETTE,
+        chunk: { index: 0, blocks: [{ id: 'b1', text: 'x' }] },
+        totalChunks: 1,
+      })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    eq(calls, 1, '只调一次');
+    ok(err instanceof JudgeError && (err as JudgeError).code === 'rate_limited', '归 rate_limited');
+  });
+
   await test('第一次失败、第二次成功 → 只调两次且返回结果', async () => {
     let calls = 0;
     const judge = new LlmJudge({
@@ -1255,6 +1350,22 @@ async function suiteHttpAuth(): Promise<void> {
       });
       eq(reply.status, 400, '回复的空正文必须被拒');
       eq(reply.body.error, 'invalid_body', '错误码');
+    });
+
+    await test('CORS 暴露 Retry-After(否则前端读不到真实冷却窗口)', async () => {
+      // 跨源 fetch 只能看到 safelisted 响应头,Retry-After 不在其中;不显式
+      // Access-Control-Expose-Headers 的话,前端 429 后只能退化成写死的秒数,
+      // 而真实的限流窗口是 10 分钟 —— 冷却会在窗口结束前就到期。
+      // /healthz 是监控端点,刻意不带 CORS;用会带 CORS 的业务端点测
+      const res = await api(h, `/api/annotations?page=${encodeURIComponent(PAGE)}&scope=public`, {
+        headers: { Origin: 'https://aipm.ac' },
+      });
+      eq(res.headers.get('access-control-allow-origin'), 'https://aipm.ac', '反射白名单 Origin');
+      eq(res.headers.get('access-control-expose-headers'), 'Retry-After', '暴露 Retry-After');
+      const outside = await api(h, `/api/annotations?page=${encodeURIComponent(PAGE)}&scope=public`, {
+        headers: { Origin: 'https://evil.example' },
+      });
+      eq(outside.headers.get('access-control-allow-origin'), null, '白名单外不给 ACAO');
     });
 
     await test('导出:只含公开 + 本人私有', async () => {

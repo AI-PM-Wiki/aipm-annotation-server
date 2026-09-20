@@ -102,6 +102,11 @@ export function createApp(deps: ServerDeps) {
     const headers: Record<string, string> = { Vary: 'Origin' };
     if (origin !== undefined && config.allowedOrigins.includes(origin)) {
       headers['Access-Control-Allow-Origin'] = origin;
+      // Retry-After 不在 CORS 安全清单里,不显式 expose 的话前端读不到它
+      // (跨源 fetch 只能看到 safelisted 响应头)。读不到就只能退化成写死的
+      // 冷却秒数,而 429 的真实窗口是 10 分钟 —— 冷却会在窗口结束前到期,
+      // 用户按提示重试仍旧撞 429。
+      headers['Access-Control-Expose-Headers'] = 'Retry-After';
     }
     return headers;
   }

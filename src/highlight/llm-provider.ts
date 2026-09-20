@@ -250,6 +250,13 @@ export class LlmJudge implements HighlightJudge {
         throw new JudgeError('rate_limited', `LLM 限流(HTTP ${status})`, 60);
       }
       if (controller.signal.aborted) throw new JudgeError('timeout', 'LLM 调用超时');
+      // 结构化输出没通过 zod 校验时,SDK 的 helpers/zod 会抛 AnthropicError,而不是回一个
+      // parsed_output:null。它本质是「形状不对」(模型跑题/漏块/JSON 不合法),不是 HTTP
+      // 层错误 —— 归到 shape 才能让上层按同一类失败去重试与记日志。
+      const message = err instanceof Error ? err.message : String(err);
+      if (/Failed to parse structured output/.test(message)) {
+        throw new JudgeError('shape', message.slice(0, 200));
+      }
       throw toJudgeError(err);
     } finally {
       clearTimeout(timer);
@@ -269,6 +276,7 @@ export class LlmJudge implements HighlightJudge {
     let lastUsage: JudgeUsage | undefined;
     let lastModel: string | undefined;
     let lastReason = '解析后没有任何有效片段(JSON 结构不符,或 id 对不上)';
+    let lastError: JudgeError | null = null;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       const prompt =
@@ -281,14 +289,36 @@ export class LlmJudge implements HighlightJudge {
               lastReason,
               '所有片段都必须出现,id 原样回填,颜色必须来自色板。',
             ].join('\n');
-      const { suggestions, usage, model } = await this.call(
-        prompt,
-        blocks,
-        request.palette,
-        request.signal,
-      );
+      // 调用本身抛错(JSON 不合法被 SDK 的解析器抛出、HTTP 5xx…)也要重试一次:
+      // 只重试「解析出来但一条有效建议都没有」会漏掉最常见的那类失败 ——
+      // 模型整段输出不是合法 JSON 时根本走不到归一化那一步。
+      let suggestions: Suggestion[];
+      let usage: JudgeUsage;
+      let model: string | undefined;
+      try {
+        const called = await this.call(prompt, blocks, request.palette, request.signal);
+        suggestions = called.suggestions;
+        usage = called.usage;
+        model = called.model;
+      } catch (err) {
+        const judgeErr = toJudgeError(err);
+        lastUsage = judgeErr.usage ?? lastUsage;
+        lastError = judgeErr;
+        lastReason = `${judgeErr.code}:${judgeErr.message}`;
+        // 限流 / 未配置 / 超时重发一次没有意义(立刻重发只会再撞同一堵墙,超时还会
+        // 把耗时翻倍),直接上抛交给编排器去回退或降级。
+        if (
+          judgeErr.code === 'rate_limited' ||
+          judgeErr.code === 'unavailable' ||
+          judgeErr.code === 'timeout'
+        ) {
+          throw judgeErr;
+        }
+        continue;
+      }
       lastUsage = usage;
       lastModel = model;
+      lastError = null;
       if (suggestions.length > 0) {
         const outcome: JudgeOutcome = { suggestions, usage };
         if (model !== undefined) outcome.model = model;
@@ -297,6 +327,7 @@ export class LlmJudge implements HighlightJudge {
     }
 
     // 两次都不行:把已产生的用量挂在错误上带走(钱已经花了,不能让预算当没花)
+    if (lastError !== null) throw lastError;
     const detail =
       lastModel === undefined
         ? `LLM 两次输出都无法解析:${lastReason}`
