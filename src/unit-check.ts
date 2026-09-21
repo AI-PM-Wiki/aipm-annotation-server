@@ -20,6 +20,7 @@ import type { AddressInfo } from 'node:net';
 import { loadConfig, resolveDevAuthBypass } from './config.ts';
 import type { Config } from './config.ts';
 import { AnnotationStore } from './store.ts';
+import { parseState } from './store.ts';
 import type { AnnotationRecord, Author } from './store.ts';
 import { AuthService, sanitizeReturn } from './auth.ts';
 import type { IndexStats } from './index-store.ts';
@@ -562,6 +563,42 @@ async function suiteAnnotations(): Promise<void> {
     ok(sel.ok, '三种 selector 均应保留');
     if (sel.ok) eq(sel.value.length, 3, '未知类型被丢弃');
     ok(!normalizeSelectors([]).ok, '空 selector 拒绝');
+    // 全页评论:只有显式放行时才接受空锚点。默认那条必须在上面继续成立 ——
+    // 「忘了带锚点」与「就是要整页评论」是两回事。
+    ok(normalizeSelectors([], { allowEmpty: true }).ok, '全页评论允许空 selector');
+    const junk = normalizeSelectors([{ type: 'BogusSelector' }], { allowEmpty: true });
+    ok(junk.ok, '全页评论下非法 selector 被丢弃而非报错');
+    if (junk.ok) eq(junk.value.length, 0, '非法 selector 一条不留');
+  });
+
+  await test('全页评论:存储标记透传、导出不带 selector 键', () => {
+    const pageNote = record({ body: '这一页整体写得不错', target: { selectors: [], scope: 'page' } });
+    const out = toHypothesisExport([pageNote], 'https://aipm.ac') as Array<Record<string, unknown>>;
+    const target = (out[0]!.target as Array<Record<string, unknown>>)[0]!;
+    eq(target.source, 'https://aipm.ac/ai/rag/', 'target.source 仍指向页面');
+    ok(!('selector' in target), '全页评论不带 selector 键(hypothes.is 的 page note 惯例)');
+    // 普通批注不受影响:selector 键还在
+    const normal = toHypothesisExport([record()], 'https://aipm.ac') as Array<Record<string, unknown>>;
+    const nTarget = (normal[0]!.target as Array<Record<string, unknown>>)[0]!;
+    ok('selector' in nTarget, '普通批注仍带 selector');
+    // 存储往返:parseState 必须把 scope 透传回来,否则重启后这条全页评论会退化成
+    // 「锚点为空的普通批注」,前端随即把它判成孤儿。
+    const roundTrip = parseState(
+      JSON.stringify({
+        version: 1,
+        annotations: [
+          { ...pageNote, id: 'pn1' },
+          { ...record(), id: 'a1' },
+        ],
+        sessions: [],
+      }),
+    );
+    eq(roundTrip.state.annotations.length, 2, '两条都留下');
+    eq(roundTrip.state.annotations[0]!.target.scope, 'page', 'scope 透传');
+    ok(
+      roundTrip.state.annotations[1]!.target.scope === undefined,
+      '普通批注不会凭空长出 scope',
+    );
   });
 
   await test('导出为 hypothes.is 兼容形态', () => {
@@ -1350,6 +1387,48 @@ async function suiteHttpAuth(): Promise<void> {
       });
       eq(reply.status, 400, '回复的空正文必须被拒');
       eq(reply.body.error, 'invalid_body', '错误码');
+    });
+
+    await test('全页评论:可不带锚点创建;不带 scope 的空锚点仍被拒', async () => {
+      const alice = await loginAs(h, 'code-alice');
+      const pageNote = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '这一页整体写得不错',
+          color: 'blue',
+          visibility: 'public',
+          target: { selectors: [], scope: 'page' },
+        }),
+      });
+      eq(pageNote.status, 201, '全页评论应可创建');
+      eq(pageNote.body.annotation.target.scope, 'page', 'scope 落库');
+      eq(pageNote.body.annotation.target.selectors.length, 0, '锚点为空');
+
+      // 同样传空数组、但不声明 scope → 仍然拒绝(「忘了带锚点」不该被放过)
+      const forgetful = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '忘了带锚点',
+          color: 'yellow',
+          visibility: 'public',
+          target: { selectors: [] },
+        }),
+      });
+      eq(forgetful.status, 400, '无 scope 的空锚点必须被拒');
+
+      // 公开的全页评论,别的身份也读得到
+      const bob = await loginAs(h, 'code-bob');
+      const asBob = await api(h, `/api/annotations?page=${encodeURIComponent(PAGE)}&scope=public`, {
+        token: bob.token,
+      });
+      ok(
+        (asBob.body.annotations as Array<{ id: string }>).some((a) => a.id === pageNote.body.annotation.id),
+        '公开的全页评论对他人可见',
+      );
     });
 
     await test('dev 登录端点带 CORS(本地联调要从页面里换会话)', async () => {

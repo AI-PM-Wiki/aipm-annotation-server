@@ -58,7 +58,17 @@ const CreateAnnotationSchema = z.object({
   body: z.string().max(20_000),
   color: z.string().min(1).max(32),
   visibility: z.string(),
-  target: z.object({ selectors: z.array(z.unknown()).min(1) }).passthrough(),
+  // selectors 默认允许空数组,但「空」只对显式声明 scope:'page' 的全页评论合法 ——
+  // 这道 refine 把「忘了带锚点」与「就是要整页评论」分开,见 normalizeSelectors。
+  target: z
+    .object({
+      selectors: z.array(z.unknown()).default([]),
+      scope: z.literal('page').optional(),
+    })
+    .passthrough()
+    .refine((t) => t.selectors.length > 0 || t.scope === 'page', {
+      message: "selectors 为空时必须带 scope: 'page'(全页评论)",
+    }),
 });
 
 const PatchAnnotationSchema = z.object({
@@ -342,7 +352,10 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, visibility.code, visibility.detail, cors);
       return;
     }
-    const selectors = normalizeSelectors(parsed.data.target.selectors);
+    const pageScope = parsed.data.target.scope === 'page' ? ('page' as const) : undefined;
+    const selectors = normalizeSelectors(parsed.data.target.selectors, {
+      allowEmpty: pageScope === 'page',
+    });
     if (!selectors.ok) {
       sendError(req, res, 400, selectors.code, selectors.detail, cors);
       return;
@@ -371,7 +384,9 @@ export function createApp(deps: ServerDeps) {
       color: color.value,
       body: body.value,
       author: user,
-      target: { selectors: selectors.value },
+      target: pageScope === undefined
+        ? { selectors: selectors.value }
+        : { selectors: selectors.value, scope: pageScope },
       replies: [],
       createdAt: now,
       updatedAt: now,

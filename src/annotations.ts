@@ -28,6 +28,8 @@ export interface AnnotationInput {
   color: string;
   visibility: Visibility;
   selectors: Selector[];
+  /** 'page' = 全页评论(selectors 可以为空)。 */
+  scope?: 'page';
 }
 
 export type ValidationError = { ok: false; code: string; detail: string };
@@ -75,7 +77,18 @@ export function normalizeVisibility(raw: unknown): Validation<Visibility> {
 }
 
 /** 逐条校验 selector:类型白名单 + 字段范围。未知类型整条丢弃(不拦请求)。 */
-export function normalizeSelectors(raw: unknown): Validation<Selector[]> {
+/**
+ * 锚点校验。
+ *
+ * `allowEmpty` 只对全页评论开(调用方按显式 `scope: 'page'` 传入):这类评论按定义
+ * 就不锚定任何一段文字,强制「至少一条 selector」等于让它无法存在。**默认仍然拒绝
+ * 空数组** ——「传了空数组」与「传了全是非法 selector」在语义上都该被拦下,只有显式
+ * 声明了整页语义的才是合法的空。
+ */
+export function normalizeSelectors(
+  raw: unknown,
+  opts: { allowEmpty?: boolean } = {},
+): Validation<Selector[]> {
   if (!Array.isArray(raw)) return fail('invalid_target', 'selectors 必须是数组');
   const out: Selector[] = [];
   for (const item of raw.slice(0, MAX_SELECTORS)) {
@@ -103,7 +116,9 @@ export function normalizeSelectors(raw: unknown): Validation<Selector[]> {
       out.push(sel);
     }
   }
-  if (out.length === 0) return fail('invalid_target', '至少需要一个可用的 selector');
+  if (out.length === 0 && opts.allowEmpty !== true) {
+    return fail('invalid_target', '至少需要一个可用的 selector');
+  }
   return { ok: true, value: out };
 }
 
@@ -253,11 +268,12 @@ export function toHypothesisExport(records: AnnotationRecord[], siteBase: string
     group: r.visibility === 'public' ? 'public' : `private:${r.author.githubId}`,
     created: r.createdAt,
     updated: r.updatedAt,
+    // 全页评论按 W3C / hypothes.is 的 page note 惯例:target 只留 source,
+    // **不带 selector 键**(塞空数组会被导入侧当成无效 target)。
     target: [
-      {
-        source: `${siteBase}${r.page}`,
-        selector: r.target.selectors,
-      },
+      r.target.scope === 'page'
+        ? { source: `${siteBase}${r.page}` }
+        : { source: `${siteBase}${r.page}`, selector: r.target.selectors },
     ],
     replies: r.replies.map((reply) => ({
       id: reply.id,

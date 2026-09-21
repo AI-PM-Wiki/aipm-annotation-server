@@ -15,6 +15,10 @@
 | **私有** | 本服务 | **只有作者本人**(换设备登录同一账号可见) | 需 GitHub 登录;只有本人 |
 | **仅本机** | 浏览器 localStorage | 只有那台设备 | 匿名即可,**不经过本服务** |
 
+**全页评论**(`target.scope: "page"`)是与上面三态**正交**的第二维:它讲的是锚定粒度,
+不是可见范围 —— 一条全页评论同样可以是公开/私有/仅本机。它不锚定正文任何一段文字,
+`target.selectors` 为空数组,导出成 hypothes.is 时按 page note 惯例只留 `target.source`。
+
 「私有」与「仅本机」是两件事:前者跨设备(登录同账号就能看到),后者换设备/清缓存即丢。
 **本服务没有「仅本机」的写入路径** —— 前端提交 `visibility: "local"` 会被 400 拒绝,
 这条边界由 `src/annotations.ts` 的 `normalizeVisibility` 与主仓库的契约测试一起锁住。
@@ -63,6 +67,11 @@ GET    /api/annotations/export?page=<path>                # hypothes.is JSON 兼
 (`TextQuoteSelector` / `TextPositionSelector` / `RangeSelector`),前端按三级回退锚定,
 锚不到时进「孤儿批注」而不是静默丢失。归属按 `author.githubId`(数字 id)判定 ——
 不拿 login 当键,login 可以改。
+
+`target.scope: "page"` 标记全页评论(见上表后的说明)。**空 selector 默认仍然被拒绝**:
+只有显式声明了 `scope: "page"` 才放行 ——「忘了带锚点」与「就是要整页评论」必须分开,
+这道判断在 `src/server.ts` 的 `CreateAnnotationSchema` 与 `normalizeSelectors` 的
+`allowEmpty` 两处,主仓库与子仓库各有测试锁住。
 
 回复是批注文档里的 `replies` 数组,通过 `PATCH` 提交整个数组,服务端按规则合并:
 自己的能改、批注作者能删、别人的既改不动也删不掉(`reply_forbidden`)。

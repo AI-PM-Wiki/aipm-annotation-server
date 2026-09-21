@@ -51,7 +51,12 @@ export interface AnnotationRecord {
   color: string;
   body: string;
   author: Author;
-  target: { selectors: Selector[] };
+  /**
+   * 锚点。`scope: 'page'` = 全页评论:不锚定正文任何一段文字,selectors 为空数组。
+   * 这是与「批注」并列的第二维(锚定粒度),与 visibility(可见范围)正交 ——
+   * 一条全页评论同样可以是公开/私有。缺省即普通批注(必须至少一条 selector)。
+   */
+  target: { selectors: Selector[]; scope?: 'page' };
   replies: Reply[];
   createdAt: string;
   updatedAt: string;
@@ -140,6 +145,9 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
   const selectors = Array.isArray(target.selectors)
     ? (target.selectors as Selector[]).filter(isRecord) as Selector[]
     : [];
+  // 全页评论的标记要透传:解析时吞掉它,这条评论下次重启就会退化成「锚点为空
+  // 的普通批注」,前端随即把它判成孤儿。
+  const scope: 'page' | undefined = target.scope === 'page' ? 'page' : undefined;
   const replies: Reply[] = [];
   if (Array.isArray(value.replies)) {
     for (const item of value.replies) {
@@ -163,7 +171,7 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
     color: typeof color === 'string' && color.length > 0 ? color : 'yellow',
     body,
     author,
-    target: { selectors },
+    target: scope === undefined ? { selectors } : { selectors, scope },
     replies,
     createdAt: typeof createdAt === 'string' ? createdAt : now,
     updatedAt: typeof updatedAt === 'string' ? updatedAt : now,
