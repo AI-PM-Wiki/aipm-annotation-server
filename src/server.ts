@@ -11,6 +11,10 @@
  *   POST   /api/auth/dev                      仅回环 + DEV_AUTH_BYPASS 时可用,直接发 token
  *   GET    /api/annotations?page=&scope=      scope=public 匿名可读 / scope=mine 需登录
  *   POST   /api/annotations                   需登录;body.visibility: public|private
+ *   POST   /api/annotations/:id/replies       需登录;任何能读到这条批注的人都能回
+ *   DELETE /api/annotations/:id/replies/:rid  回复作者,或批注作者
+ *   PUT    /api/annotations/:id/like          需登录;幂等
+ *   DELETE /api/annotations/:id/like          需登录;幂等
  *   PATCH  /api/annotations/:id               需登录 + 仅作者
  *   DELETE /api/annotations/:id               需登录 + 仅作者(版主可删公开)
  *   GET    /api/annotations/export?page=      hypothes.is JSON 兼容导出
@@ -33,6 +37,8 @@ import { canonicalPage } from './index-store.ts';
 import type { IndexLike } from './index-store.ts';
 import { PageTextIndex } from './index-store.ts';
 import {
+  appendReply,
+  applyLike,
   canDelete,
   canEdit,
   canRead,
@@ -42,7 +48,10 @@ import {
   normalizeBody,
   normalizeColor,
   normalizeSelectors,
+  normalizeStyle,
   normalizeVisibility,
+  removeReply,
+  toClientJson,
   toHypothesisExport,
 } from './annotations.ts';
 import type { ReplyInput } from './annotations.ts';
@@ -57,6 +66,8 @@ const CreateAnnotationSchema = z.object({
   // 空正文合法:纯高亮没有文字(见 normalizeBody 的 allowEmpty)
   body: z.string().max(20_000),
   color: z.string().min(1).max(32),
+  // 画法。可选:不带按 highlight 处理(与这个字段存在之前的行为一致)
+  style: z.string().optional(),
   visibility: z.string(),
   // selectors 默认允许空数组,但「空」只对显式声明 scope:'page' 的全页评论合法 ——
   // 这道 refine 把「忘了带锚点」与「就是要整页评论」分开,见 normalizeSelectors。
@@ -74,10 +85,20 @@ const CreateAnnotationSchema = z.object({
 const PatchAnnotationSchema = z.object({
   body: z.string().optional(),
   color: z.string().optional(),
+  style: z.string().optional(),
   visibility: z.string().optional(),
   replies: z
-    .array(z.object({ id: z.string().optional(), body: z.string() }).passthrough())
+    .array(
+      z
+        .object({ id: z.string().optional(), body: z.string(), parentId: z.string().optional() })
+        .passthrough(),
+    )
     .optional(),
+});
+
+const ReplyCreateSchema = z.object({
+  body: z.string(),
+  parentId: z.string().optional(),
 });
 
 const SuggestSchema = z.object({
@@ -312,7 +333,12 @@ export function createApp(deps: ServerDeps) {
       return;
     }
     const visible = filterForScope(annotationsOf(page), scope, actor);
-    writeJson(res, 200, { page, scope, annotations: visible }, cors);
+    writeJson(
+      res,
+      200,
+      { page, scope, annotations: visible.map((a) => toClientJson(a, actor)) },
+      cors,
+    );
   }
 
   async function handleCreateAnnotation(
@@ -352,6 +378,11 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, visibility.code, visibility.detail, cors);
       return;
     }
+    const style = normalizeStyle(parsed.data.style);
+    if (!style.ok) {
+      sendError(req, res, 400, style.code, style.detail, cors);
+      return;
+    }
     const pageScope = parsed.data.target.scope === 'page' ? ('page' as const) : undefined;
     const selectors = normalizeSelectors(parsed.data.target.selectors, {
       allowEmpty: pageScope === 'page',
@@ -382,18 +413,20 @@ export function createApp(deps: ServerDeps) {
       page,
       visibility: visibility.value,
       color: color.value,
+      style: style.value,
       body: body.value,
       author: user,
       target: pageScope === undefined
         ? { selectors: selectors.value }
         : { selectors: selectors.value, scope: pageScope },
       replies: [],
+      likes: [],
       createdAt: now,
       updatedAt: now,
     };
     store.setAnnotations([...store.annotations, record]);
     await store.flush();
-    writeJson(res, 201, { annotation: record }, cors);
+    writeJson(res, 201, { annotation: toClientJson(record, user) }, cors);
   }
 
   async function handlePatchAnnotation(
@@ -440,6 +473,14 @@ export function createApp(deps: ServerDeps) {
       }
       next.color = color.value;
     }
+    if (parsed.data.style !== undefined) {
+      const style = normalizeStyle(parsed.data.style);
+      if (!style.ok) {
+        sendError(req, res, 400, style.code, style.detail, cors);
+        return;
+      }
+      next.style = style.value;
+    }
     if (parsed.data.visibility !== undefined) {
       const visibility = normalizeVisibility(parsed.data.visibility);
       if (!visibility.ok) {
@@ -468,7 +509,108 @@ export function createApp(deps: ServerDeps) {
 
     store.setAnnotations(store.annotations.map((a) => (a.id === id ? next : a)));
     await store.flush();
-    writeJson(res, 200, { annotation: next }, cors);
+    writeJson(res, 200, { annotation: toClientJson(next, user) }, cors);
+  }
+
+  /**
+   * 追加一条回复。与 PATCH 的整数组 replies **不是一回事**:那条只有批注作者能提交
+   * (改内容仅作者),而回复天生是别人来回你的 —— 照那条路走,别人根本回不了。
+   */
+  async function handleCreateReply(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+    cors: Record<string, string>,
+    actor: Author | null | 'rejected',
+  ): Promise<void> {
+    const user = requireLogin(req, res, cors, actor);
+    if (user === null) return;
+    const record = store.annotations.find((a) => a.id === id);
+    if (record === undefined || !canRead(record, user)) {
+      sendError(req, res, 404, 'not_found', '批注不存在', cors);
+      return;
+    }
+    const json = await readJson(req, res, cors);
+    if (json === null) return;
+    const parsed = ReplyCreateSchema.safeParse(json);
+    if (!parsed.success) {
+      sendError(req, res, 400, 'bad_request', '请求体格式不正确', cors);
+      return;
+    }
+    const merged = appendReply({
+      existing: record.replies,
+      body: parsed.data.body,
+      parentId: parsed.data.parentId,
+      actor: user,
+      maxReplies: config.maxRepliesPerAnnotation,
+      maxBodyChars: config.maxBodyChars,
+      now: new Date().toISOString(),
+    });
+    if (!merged.ok) {
+      sendError(req, res, 400, merged.code, merged.detail, cors);
+      return;
+    }
+    const next: AnnotationRecord = { ...record, replies: merged.value };
+    store.setAnnotations(store.annotations.map((a) => (a.id === id ? next : a)));
+    await store.flush();
+    writeJson(res, 201, { annotation: toClientJson(next, user) }, cors);
+  }
+
+  async function handleDeleteReply(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+    replyId: string,
+    cors: Record<string, string>,
+    actor: Author | null | 'rejected',
+  ): Promise<void> {
+    const user = requireLogin(req, res, cors, actor);
+    if (user === null) return;
+    const record = store.annotations.find((a) => a.id === id);
+    if (record === undefined || !canRead(record, user)) {
+      sendError(req, res, 404, 'not_found', '批注不存在', cors);
+      return;
+    }
+    const removed = removeReply(record.replies, replyId, user, canEdit(record, user));
+    if (!removed.ok) {
+      sendError(req, res, removed.code === 'reply_forbidden' ? 403 : 404, removed.code, removed.detail, cors);
+      return;
+    }
+    const next: AnnotationRecord = { ...record, replies: removed.value };
+    store.setAnnotations(store.annotations.map((a) => (a.id === id ? next : a)));
+    await store.flush();
+    writeJson(res, 200, { annotation: toClientJson(next, user) }, cors);
+  }
+
+  /**
+   * 点赞 / 取消点赞。幂等:重复 PUT 或重复 DELETE 都成功,不报错也不重复计数 ——
+   * 客户端重试与连点都不必自己做去重。
+   *
+   * 与读权限同规矩:读不到的一律 404(私有批注不泄露存在性)。**不做「只能赞
+   * 公开批注」的限制** —— 私有批注只有作者本人读得到,他赞自己的笔记无害,
+   * 而多一条特例就多一处要解释、要测的规则。
+   */
+  async function handleLikeAnnotation(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+    liked: boolean,
+    cors: Record<string, string>,
+    actor: Author | null | 'rejected',
+  ): Promise<void> {
+    const user = requireLogin(req, res, cors, actor);
+    if (user === null) return;
+    const record = store.annotations.find((a) => a.id === id);
+    if (record === undefined || !canRead(record, user)) {
+      sendError(req, res, 404, 'not_found', '批注不存在', cors);
+      return;
+    }
+    const next = applyLike(record, user, liked);
+    if (next !== record) {
+      store.setAnnotations(store.annotations.map((a) => (a.id === id ? next : a)));
+      await store.flush();
+    }
+    writeJson(res, 200, { annotation: toClientJson(next, user) }, cors);
   }
 
   async function handleDeleteAnnotation(
@@ -764,9 +906,38 @@ export function createApp(deps: ServerDeps) {
           sendError(req, res, 404, 'not_found', '批注不存在', cors);
           return;
         }
-        writeJson(res, 200, { annotation: record }, cors);
+        writeJson(res, 200, { annotation: toClientJson(record, actor) }, cors);
         return;
       }
+    }
+
+    const replyMatch = /^\/api\/annotations\/([^/]+)\/replies$/.exec(path);
+    if (replyMatch !== null && method === 'POST') {
+      const id = decodeURIComponent(replyMatch[1]!);
+      void handleCreateReply(req, res, id, cors, authenticate(req, res, cors)).catch(fail);
+      return;
+    }
+
+    const replyOneMatch = /^\/api\/annotations\/([^/]+)\/replies\/([^/]+)$/.exec(path);
+    if (replyOneMatch !== null && method === 'DELETE') {
+      const id = decodeURIComponent(replyOneMatch[1]!);
+      const replyId = decodeURIComponent(replyOneMatch[2]!);
+      void handleDeleteReply(req, res, id, replyId, cors, authenticate(req, res, cors)).catch(fail);
+      return;
+    }
+
+    const likeMatch = /^\/api\/annotations\/([^/]+)\/like$/.exec(path);
+    if (likeMatch !== null && (method === 'PUT' || method === 'DELETE')) {
+      const id = decodeURIComponent(likeMatch[1]!);
+      void handleLikeAnnotation(
+        req,
+        res,
+        id,
+        method === 'PUT',
+        cors,
+        authenticate(req, res, cors),
+      ).catch(fail);
+      return;
     }
 
     // ---- 智能高亮 ----

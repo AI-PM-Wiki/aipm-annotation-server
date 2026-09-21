@@ -60,6 +60,10 @@ POST   /api/annotations                                   # 需登录;body.visib
 GET    /api/annotations/:id                               # 无权读 → 404
 PATCH  /api/annotations/:id                               # 需登录 + 仅作者
 DELETE /api/annotations/:id                               # 需登录 + 仅作者(版主可删公开)
+POST   /api/annotations/:id/replies                       # 需登录 + 能读到即可;body:{body,parentId?}
+DELETE /api/annotations/:id/replies/:replyId              # 回复作者,或批注作者
+PUT    /api/annotations/:id/like                          # 需登录;幂等
+DELETE /api/annotations/:id/like                          # 需登录;幂等
 GET    /api/annotations/export?page=<path>                # hypothes.is JSON 兼容导出
 ```
 
@@ -73,8 +77,37 @@ GET    /api/annotations/export?page=<path>                # hypothes.is JSON 兼
 这道判断在 `src/server.ts` 的 `CreateAnnotationSchema` 与 `normalizeSelectors` 的
 `allowEmpty` 两处,主仓库与子仓库各有测试锁住。
 
-回复是批注文档里的 `replies` 数组,通过 `PATCH` 提交整个数组,服务端按规则合并:
-自己的能改、批注作者能删、别人的既改不动也删不掉(`reply_forbidden`)。
+### 回复
+
+回复存在批注文档的 `replies` 数组里,但有**两条写入路径**,别混:
+
+- `POST /api/annotations/:id/replies` —— **普通回复走这条**。任何登录用户,只要能读到
+  这条批注,就能回。这是「回复」二字的定义:别人回你。
+- `PATCH /api/annotations/:id` 的 `replies`(**整数组**语义)—— 仅批注作者,按
+  `mergeReplies` 的规则合并,是楼层楼主清理楼内回复的通道。自己的能改、批注作者能删、
+  别人的既改不动也删不掉(`reply_forbidden`)。
+
+早先只有 PATCH 这一条路,而 PATCH 是「仅作者」的 —— 结果是**别人根本回不了你的批注**。
+`POST` 那条就是为补这个洞加的;`DELETE .../replies/:replyId` 让回复作者与楼主各自能删
+自己该删的。
+
+回复可以互相回复:新回复带 `parentId` 指向同一条批注下的另一条回复,父回复必须已存在
+(否则 `reply_not_found`)。**删父回复不级联删子回复** —— 别人在它下面的发言不该被连带
+抹掉;前端把「找不到父级」的按顶层渲染。
+
+批注的**画法** `style` 与颜色 `color` 正交:`underline`(只画下划线)/ `highlight`
+(只铺底色)/ `both`(两者都画)。缺省 `highlight` —— 这也是引入这个字段之前的行为,
+所以不带 `style` 的老客户端照常工作;带了但认不出来的才报 `invalid_style`。
+
+### 点赞
+
+`likes` 存的是**点过赞的人的 GitHub 数字 id 列表**,但对外**只回 `likeCount` 与
+`likedByMe`**,不回原始名单 —— 谁赞过既是隐私面(能看出谁读了哪一页)又没有展示价值。
+`toClientJson` 是唯一的出口,所有返回批注的响应都过它。
+
+`PUT` / `DELETE` 都**幂等**:已赞再赞、未赞再取消都返回成功且不改变计数,客户端重试与
+连点不必自己去重。点赞不碰 `updatedAt` —— 点个赞不该让这条显示成「刚编辑过」。
+未登录一律 401;读不到的批注(他人的私有)是 **404 而不是 403**,与读权限同规矩。
 
 批注自身的 `body` **允许为空** —— 智能高亮的产出就是「一段被划了线的话」,那本身
 就是一个完整的批注,强制写文字会让「采纳建议」变成「必须先写点什么」。回复的正文

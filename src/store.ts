@@ -14,6 +14,13 @@ import { dirname, join } from 'node:path';
 
 export type Visibility = 'public' | 'private';
 
+/**
+ * 批注的**画法**,与 color(颜色)正交:
+ *   underline 只画下划线;highlight 只铺底色;both 两者都画。
+ * 缺省 highlight —— 这也是引入这个字段之前的行为,老记录读出来仍是老样子。
+ */
+export type AnnotationStyle = 'underline' | 'highlight' | 'both';
+
 export type Selector =
   | { type: 'TextQuoteSelector'; exact: string; prefix?: string; suffix?: string }
   | { type: 'TextPositionSelector'; start: number; end: number }
@@ -41,6 +48,12 @@ export interface Reply {
   author: Author;
   createdAt: string;
   updatedAt: string;
+  /**
+   * 回复的回复:指向同一条批注下另一条回复的 id。
+   * 父回复被删之后这里会留下一个悬空 id —— 前端把「找不到父级」的当成顶层回复渲染,
+   * 不在服务端做级联删除:删一条回复不该顺手抹掉别人在它下面的发言。
+   */
+  parentId?: string;
 }
 
 export interface AnnotationRecord {
@@ -49,6 +62,7 @@ export interface AnnotationRecord {
   page: string;
   visibility: Visibility;
   color: string;
+  style: AnnotationStyle;
   body: string;
   author: Author;
   /**
@@ -58,6 +72,9 @@ export interface AnnotationRecord {
    */
   target: { selectors: Selector[]; scope?: 'page' };
   replies: Reply[];
+  /** 点过赞的人的 GitHub 数字 id,升序无重复。对外只暴露计数与「我赞过没」,
+   *  见 annotations.ts 的 toClientJson —— 谁赞过是隐私面,也没有展示价值。 */
+  likes: number[];
   createdAt: string;
   updatedAt: string;
 }
@@ -82,6 +99,9 @@ export interface StoredState {
 }
 
 const EMPTY_STATE: StoredState = { version: 1, annotations: [], sessions: [] };
+
+/** 单条批注的点赞数上限。存储文件可能被手工编辑,解析时不设上限就是给自己挖坑。 */
+const MAX_LIKES = 50_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -154,13 +174,29 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
       if (!isRecord(item)) continue;
       const replyAuthor = parseAuthor(item.author);
       if (replyAuthor === null || typeof item.id !== 'string' || typeof item.body !== 'string') continue;
-      replies.push({
+      const reply: Reply = {
         id: item.id,
         body: item.body,
         author: replyAuthor,
         createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date(0).toISOString(),
         updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : new Date(0).toISOString(),
-      });
+      };
+      if (typeof item.parentId === 'string' && item.parentId.length > 0) {
+        reply.parentId = item.parentId;
+      }
+      replies.push(reply);
+    }
+  }
+  // 认不出的 style 一律回落 highlight(而不是丢整条记录):这是画法,不是内容
+  const style: AnnotationStyle =
+    value.style === 'underline' || value.style === 'both' ? value.style : 'highlight';
+  const likes: number[] = [];
+  if (Array.isArray(value.likes)) {
+    for (const item of value.likes) {
+      if (typeof item !== 'number' || !Number.isFinite(item)) continue;
+      if (likes.includes(item)) continue;
+      likes.push(item);
+      if (likes.length >= MAX_LIKES) break;
     }
   }
   const now = new Date(0).toISOString();
@@ -169,10 +205,12 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
     page,
     visibility,
     color: typeof color === 'string' && color.length > 0 ? color : 'yellow',
+    style,
     body,
     author,
     target: scope === undefined ? { selectors } : { selectors, scope },
     replies,
+    likes,
     createdAt: typeof createdAt === 'string' ? createdAt : now,
     updatedAt: typeof updatedAt === 'string' ? updatedAt : now,
   };

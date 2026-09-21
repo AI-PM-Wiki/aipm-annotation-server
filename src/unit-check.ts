@@ -27,6 +27,8 @@ import type { IndexStats } from './index-store.ts';
 import { canonicalPage, normalizeForMatch, normalizePagePath, verifyBlocks } from './index-store.ts';
 import type { IndexLike } from './index-store.ts';
 import {
+  appendReply,
+  applyLike,
   canDelete,
   canEdit,
   canRead,
@@ -34,7 +36,10 @@ import {
   mergeReplies,
   normalizeBody,
   normalizeSelectors,
+  normalizeStyle,
   normalizeVisibility,
+  removeReply,
+  toClientJson,
   toHypothesisExport,
 } from './annotations.ts';
 import { DailyBudget, DailyCounter } from './budget.ts';
@@ -410,10 +415,12 @@ function record(over: Partial<AnnotationRecord> = {}): AnnotationRecord {
     page: PAGE,
     visibility: 'public',
     color: 'yellow',
+    style: 'highlight',
     body: '正文',
     author: ALICE,
     target: { selectors: [{ type: 'TextQuoteSelector', exact: '文本' }] },
     replies: [],
+    likes: [],
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
     ...over,
@@ -539,6 +546,138 @@ async function suiteAnnotations(): Promise<void> {
       now: 'now',
     });
     ok(!empty.ok && empty.code === 'invalid_body', '空正文应拒');
+  });
+
+  await test('批注画法:缺省按 highlight,认不出的才是错', () => {
+    eq(normalizeStyle(undefined).ok, true, '不带 style 合法');
+    eq((normalizeStyle(undefined) as { value: string }).value, 'highlight', '缺省 = 高亮');
+    for (const v of ['underline', 'highlight', 'both']) {
+      eq((normalizeStyle(v) as { value: string }).value, v, `合法值 ${v}`);
+    }
+    ok(!normalizeStyle('wavy').ok, '认不出的画法应拒');
+    ok(!normalizeStyle(7).ok, '非字符串应拒');
+  });
+
+  await test('appendReply:父回复必须存在,超上限与空正文被拒', () => {
+    const base = {
+      existing: [] as Array<{ id: string; body: string; author: Author; createdAt: string; updatedAt: string }>,
+      actor: BOB,
+      maxReplies: 2,
+      maxBodyChars: 100,
+      now: 'now',
+      newId: () => 'new',
+    };
+    const okAppend = appendReply({ ...base, body: ' 你好 ' });
+    ok(okAppend.ok, '正常追加');
+    eq(okAppend.ok && okAppend.value[0]?.body, '你好', '正文 trim');
+    eq(okAppend.ok && okAppend.value[0]?.author.githubId, BOB.githubId, '归属当前身份');
+
+    ok(!appendReply({ ...base, body: '   ' }).ok, '空正文拒');
+    ok(
+      !appendReply({ ...base, body: 'x', parentId: 'nope' }).ok,
+      '父回复不存在拒',
+    );
+    const full = appendReply({
+      ...base,
+      existing: [
+        { id: 'a', body: 'a', author: ALICE, createdAt: 't', updatedAt: 't' },
+        { id: 'b', body: 'b', author: ALICE, createdAt: 't', updatedAt: 't' },
+      ],
+      body: 'c',
+    });
+    ok(!full.ok && full.code === 'too_many_replies', '超上限拒');
+  });
+
+  await test('removeReply:回复作者或批注作者可删,不级联', () => {
+    const replies = [
+      { id: 'r1', body: '一层', author: BOB, createdAt: 't', updatedAt: 't' },
+      { id: 'r2', body: '回一层', author: ALICE, createdAt: 't', updatedAt: 't', parentId: 'r1' },
+    ];
+    const byOther = removeReply(replies, 'r1', ALICE, false);
+    ok(!byOther.ok && byOther.code === 'reply_forbidden', '非作者非楼主拒');
+    const byOwner = removeReply(replies, 'r1', ALICE, true);
+    ok(byOwner.ok, '楼主可删');
+    eq(byOwner.ok && byOwner.value.length, 1, '只删一条,不级联删它下面的');
+    eq(byOwner.ok && byOwner.value[0]?.parentId, 'r1', '子回复保留原 parentId(前端按顶层渲染)');
+    const bySelf = removeReply(replies, 'r1', BOB, false);
+    ok(bySelf.ok, '回复作者自己可删');
+    ok(!removeReply(replies, 'nope', BOB, true).ok, '不存在拒');
+  });
+
+  await test('点赞幂等,且不动 updatedAt', () => {
+    const base = record();
+    const liked = applyLike(base, BOB, true);
+    eq(liked.likes, [BOB.githubId], '赞上');
+    ok(applyLike(liked, BOB, true) === liked, '重复赞返回原对象(调用方据此跳过落盘)');
+    eq(applyLike(liked, ALICE, true).likes.length, 2, '不同人各记一次');
+    const unliked = applyLike(liked, BOB, false);
+    eq(unliked.likes, [], '取消');
+    ok(applyLike(base, BOB, false) === base, '没赞过再取消也返回原对象');
+    eq(liked.updatedAt, base.updatedAt, '点赞不该让这条显示成刚编辑过');
+  });
+
+  await test('对外形态只给计数与「我赞过没」,不给点赞者名单', () => {
+    const liked = applyLike(applyLike(record(), BOB, true), ALICE, true);
+    const forBob = toClientJson(liked, BOB);
+    const anon = toClientJson(liked, null);
+    eq((liked as { likes?: unknown }).likes !== undefined, true, '存储里仍有原始名单');
+    eq((forBob as { likes?: unknown }).likes, undefined, '对外不带原始名单');
+    eq(forBob.likeCount, 2, '计数');
+    eq(forBob.likedByMe, true, '我自己赞过');
+    eq(anon.likeCount, 2, '未登录也看得到计数');
+    eq(anon.likedByMe, false, '未登录没有「我赞过」');
+  });
+
+  await test('回复的回复:只能挂到存在的楼层上', () => {
+    const root = {
+      id: 'r1',
+      body: '一层',
+      author: ALICE,
+      createdAt: 't',
+      updatedAt: 't',
+    };
+    const good = mergeReplies({
+      existing: [root],
+      incoming: [{ body: '回一层', parentId: 'r1' }],
+      actor: BOB,
+      isAnnotationOwner: false,
+      maxReplies: 10,
+      maxBodyChars: 100,
+      now: 'now',
+      newId: () => 'r2',
+    });
+    ok(good.ok, '挂到已存楼层上应通过');
+    eq(
+      good.ok && good.value.some((r) => r.parentId === 'r1'),
+      true,
+      'parentId 要透传下去',
+    );
+
+    const sameBatch = mergeReplies({
+      existing: [root],
+      incoming: [{ body: '回一层', parentId: 'r1' }, { body: '再回那条', parentId: 'r2' }],
+      actor: BOB,
+      isAnnotationOwner: false,
+      maxReplies: 10,
+      maxBodyChars: 100,
+      now: 'now',
+      newId: (() => {
+        let n = 1;
+        return () => `r${++n}`;
+      })(),
+    });
+    ok(sameBatch.ok, '同一批里回刚收下的那条也应通过');
+
+    const bad = mergeReplies({
+      existing: [root],
+      incoming: [{ body: '回不存在的', parentId: 'nope' }],
+      actor: BOB,
+      isAnnotationOwner: false,
+      maxReplies: 10,
+      maxBodyChars: 100,
+      now: 'now',
+    });
+    ok(!bad.ok && bad.code === 'reply_not_found', '指向不存在的楼层应拒');
   });
 
   await test('输入校验:正文长度、可见性、色板 id、selector', () => {
@@ -1429,6 +1568,200 @@ async function suiteHttpAuth(): Promise<void> {
         (asBob.body.annotations as Array<{ id: string }>).some((a) => a.id === pageNote.body.annotation.id),
         '公开的全页评论对他人可见',
       );
+    });
+
+    await test('画法随创建落库;不带 style 的请求仍按高亮处理', async () => {
+      const alice = await loginAs(h, 'code-alice');
+      const withStyle = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '画法测试',
+          color: 'green',
+          style: 'both',
+          visibility: 'public',
+          target: { selectors: [{ type: 'TextQuoteSelector', exact: '画法' }] },
+        }),
+      });
+      eq(withStyle.status, 201, '带 style 可创建');
+      eq(withStyle.body.annotation.style, 'both', 'style 落库');
+
+      // 老客户端不带 style:按 highlight 处理,不能被拒
+      const legacy = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '老客户端',
+          color: 'green',
+          visibility: 'public',
+          target: { selectors: [{ type: 'TextQuoteSelector', exact: '老' }] },
+        }),
+      });
+      eq(legacy.status, 201, '不带 style 仍可创建');
+      eq(legacy.body.annotation.style, 'highlight', '缺省高亮');
+
+      const bogus = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '乱发画法',
+          color: 'green',
+          style: 'wavy',
+          visibility: 'public',
+          target: { selectors: [{ type: 'TextQuoteSelector', exact: 'x' }] },
+        }),
+      });
+      eq(bogus.status, 400, '认不出的画法要拒');
+      eq(bogus.body.error, 'invalid_style', '错误码');
+    });
+
+    await test('点赞:未登录 401、幂等、私有批注对他人 404、对外不带点赞者名单', async () => {
+      const alice = await loginAs(h, 'code-alice');
+      const bob = await loginAs(h, 'code-bob');
+
+      const created = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '点赞目标',
+          color: 'pink',
+          visibility: 'public',
+          target: { selectors: [{ type: 'TextQuoteSelector', exact: '赞' }] },
+        }),
+      });
+      const id = created.body.annotation.id as string;
+      eq(created.body.annotation.likeCount, 0, '新建 0 赞');
+      eq((created.body.annotation as { likes?: unknown }).likes, undefined, '对外不带原始名单');
+
+      const anon = await api(h, `/api/annotations/${id}/like`, { method: 'PUT' });
+      eq(anon.status, 401, '未登录点赞 → 401');
+      eq(anon.body.error, 'login_required', '错误码');
+
+      const first = await api(h, `/api/annotations/${id}/like`, { method: 'PUT', token: bob.token });
+      eq(first.status, 200, '登录后可赞');
+      eq(first.body.annotation.likeCount, 1, '计数 +1');
+      eq(first.body.annotation.likedByMe, true, '我赞过');
+
+      const again = await api(h, `/api/annotations/${id}/like`, { method: 'PUT', token: bob.token });
+      eq(again.body.annotation.likeCount, 1, '重复赞不叠加(幂等)');
+
+      // 别人的视角:看得到计数,看不到「我赞过」
+      const asAlice = await api(h, `/api/annotations/${id}`, { token: alice.token });
+      eq(asAlice.body.annotation.likeCount, 1, '作者看得到计数');
+      eq(asAlice.body.annotation.likedByMe, false, '作者没赞过');
+
+      const off = await api(h, `/api/annotations/${id}/like`, {
+        method: 'DELETE',
+        token: bob.token,
+      });
+      eq(off.body.annotation.likeCount, 0, '取消点赞');
+      const offAgain = await api(h, `/api/annotations/${id}/like`, {
+        method: 'DELETE',
+        token: bob.token,
+      });
+      eq(offAgain.status, 200, '重复取消也成功(幂等)');
+      eq(offAgain.body.annotation.likeCount, 0, '不会点成负数');
+
+      // 私有批注:他人连点赞都该是 404(不泄露存在性),而不是 403
+      const priv = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '私有的',
+          color: 'pink',
+          visibility: 'private',
+          target: { selectors: [{ type: 'TextQuoteSelector', exact: '私' }] },
+        }),
+      });
+      const privId = priv.body.annotation.id as string;
+      const bobLike = await api(h, `/api/annotations/${privId}/like`, {
+        method: 'PUT',
+        token: bob.token,
+      });
+      eq(bobLike.status, 404, '赞他人的私有批注 → 404 而不是 403');
+    });
+
+    await test('回复:别人也能回;回复的回复带 parentId;删自己的楼层', async () => {
+      const alice = await loginAs(h, 'code-alice');
+      const bob = await loginAs(h, 'code-bob');
+      const created = await api(h, '/api/annotations', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({
+          page: PAGE,
+          body: '楼层楼主',
+          color: 'yellow',
+          visibility: 'public',
+          target: { selectors: [{ type: 'TextQuoteSelector', exact: '楼' }] },
+        }),
+      });
+      const id = created.body.annotation.id as string;
+
+      // 关键:Bob 不是作者,也必须回得了 —— 走 PATCH 的话这里会是 403
+      const first = await api(h, `/api/annotations/${id}/replies`, {
+        method: 'POST',
+        token: bob.token,
+        body: JSON.stringify({ body: '一层' }),
+      });
+      eq(first.status, 201, '非作者也能回复');
+      const rootId = (first.body.annotation.replies as Array<{ id: string }>)[0]!.id;
+
+      const nested = await api(h, `/api/annotations/${id}/replies`, {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({ body: '回一层', parentId: rootId }),
+      });
+      eq(nested.status, 201, '回复的回复');
+      const replies = nested.body.annotation.replies as Array<{ id: string; parentId?: string }>;
+      eq(replies.length, 2, '两条');
+      eq(replies[1]?.parentId, rootId, 'parentId 落库');
+
+      const anonReply = await api(h, `/api/annotations/${id}/replies`, {
+        method: 'POST',
+        body: JSON.stringify({ body: '我没登录' }),
+      });
+      eq(anonReply.status, 401, '未登录不能回复');
+
+      const dangling = await api(h, `/api/annotations/${id}/replies`, {
+        method: 'POST',
+        token: bob.token,
+        body: JSON.stringify({ body: '回不存在的', parentId: 'nope' }),
+      });
+      eq(dangling.status, 400, '指向不存在的楼层应拒');
+      eq(dangling.body.error, 'reply_not_found', '错误码');
+
+      const empty = await api(h, `/api/annotations/${id}/replies`, {
+        method: 'POST',
+        token: bob.token,
+        body: JSON.stringify({ body: '   ' }),
+      });
+      eq(empty.status, 400, '空回复应拒');
+
+      // 删:回的人自己能删,别人不行;楼主能删楼里的任何一条
+      const bobDelete = await api(h, `/api/annotations/${id}/replies/${rootId}`, {
+        method: 'DELETE',
+        token: bob.token,
+      });
+      eq(bobDelete.status, 200, '回复作者可删自己的');
+      const left = bobDelete.body.annotation.replies as Array<{ id: string }>;
+      eq(left.length, 1, '只剩楼主那条');
+
+      const bobDeleteOthers = await api(h, `/api/annotations/${id}/replies/${left[0]!.id}`, {
+        method: 'DELETE',
+        token: bob.token,
+      });
+      eq(bobDeleteOthers.status, 403, '删别人的回复 → 403');
+
+      const ownerDelete = await api(h, `/api/annotations/${id}/replies/${left[0]!.id}`, {
+        method: 'DELETE',
+        token: alice.token,
+      });
+      eq(ownerDelete.status, 200, '楼主可删楼里的任何一条');
     });
 
     await test('dev 登录端点带 CORS(本地联调要从页面里换会话)', async () => {

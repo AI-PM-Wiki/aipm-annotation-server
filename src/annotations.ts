@@ -10,7 +10,14 @@
  *  - local   只在浏览器 localStorage,服务端没有对应路径 —— 本文件不涉及。
  */
 import { randomUUID } from 'node:crypto';
-import type { AnnotationRecord, Author, Reply, Selector, Visibility } from './store.ts';
+import type {
+  AnnotationRecord,
+  AnnotationStyle,
+  Author,
+  Reply,
+  Selector,
+  Visibility,
+} from './store.ts';
 
 /** 色板 id 由前端定义,服务端只约束形态(不硬编码色板,便于前端加色)。 */
 const PALETTE_ID_RE = /^[a-z][a-z0-9_-]{0,23}$/;
@@ -20,12 +27,15 @@ const MAX_SELECTOR_TEXT = 4_000;
 export interface ReplyInput {
   id?: string;
   body: string;
+  /** 回复的回复:指向同一条批注下的另一条回复。 */
+  parentId?: string;
 }
 
 export interface AnnotationInput {
   page: string;
   body: string;
   color: string;
+  style: AnnotationStyle;
   visibility: Visibility;
   selectors: Selector[];
   /** 'page' = 全页评论(selectors 可以为空)。 */
@@ -69,6 +79,16 @@ export function normalizeColor(raw: unknown): Validation<string> {
     return fail('invalid_color', 'color 必须是合法色板 id');
   }
   return { ok: true, value: raw };
+}
+
+/**
+ * 画法。**缺省不是错误**:这个字段是后加的,不带 style 的请求按 highlight 处理
+ * (与引入它之前的行为一致);带了但认不出来才是错 —— 那说明客户端在乱发。
+ */
+export function normalizeStyle(raw: unknown): Validation<AnnotationStyle> {
+  if (raw === undefined || raw === null || raw === '') return { ok: true, value: 'highlight' };
+  if (raw === 'underline' || raw === 'highlight' || raw === 'both') return { ok: true, value: raw };
+  return fail('invalid_style', 'style 只能是 underline / highlight / both');
 }
 
 export function normalizeVisibility(raw: unknown): Validation<Visibility> {
@@ -224,13 +244,23 @@ export function mergeReplies(opts: MergeRepliesOptions): Validation<Reply[]> {
       kept.add(prev.id);
       out.push({ ...prev, body: bodyResult.value, updatedAt: now });
     } else {
-      out.push({
+      let parentId: string | undefined;
+      if (typeof item.parentId === 'string' && item.parentId.length > 0) {
+        // 只认「已存的」或「这一批里刚收下的」—— 后者让「先回一层、再回那条新回复」
+        // 在一次 PATCH 里也成立。指向不存在的楼层直接拒,免得列表里出现孤儿。
+        const known = byId.has(item.parentId) || out.some((r) => r.id === item.parentId);
+        if (!known) return fail('reply_not_found', '要回复的那条回复不存在');
+        parentId = item.parentId;
+      }
+      const reply: Reply = {
         id: newId(),
         body: bodyResult.value,
         author: actor,
         createdAt: now,
         updatedAt: now,
-      });
+      };
+      if (parentId !== undefined) reply.parentId = parentId;
+      out.push(reply);
     }
   }
 
@@ -248,6 +278,110 @@ export function mergeReplies(opts: MergeRepliesOptions): Validation<Reply[]> {
     return fail('too_many_replies', `回复数超过 ${maxReplies} 条上限`);
   }
   return { ok: true, value: out };
+}
+
+/**
+ * 追加一条回复。
+ *
+ * 为什么不是复用 mergeReplies:PATCH 的 replies 是**整数组**语义、且只有批注作者
+ * 能提交(改内容仅作者)。照那条路走,别人根本回不了你的批注 —— 而「回复」的定义
+ * 就是别人回你。所以单开一条追加语义的路:任何能读到这条批注的登录用户都能追加。
+ */
+export function appendReply(opts: {
+  existing: Reply[];
+  body: string;
+  parentId?: string;
+  actor: Author;
+  maxReplies: number;
+  maxBodyChars: number;
+  now: string;
+  newId?: () => string;
+}): Validation<Reply[]> {
+  const { existing, actor, maxReplies, maxBodyChars, now } = opts;
+  if (existing.length >= maxReplies) {
+    return fail('too_many_replies', `回复数超过 ${maxReplies} 条上限`);
+  }
+  const body = normalizeBody(opts.body, maxBodyChars);
+  if (!body.ok) return body;
+  let parentId: string | undefined;
+  if (opts.parentId !== undefined && opts.parentId !== '') {
+    // 父回复必须已经存在。悬空的 parentId 会让前端渲染出一层没有出处的缩进。
+    if (!existing.some((r) => r.id === opts.parentId)) {
+      return fail('reply_not_found', '要回复的那条回复不存在');
+    }
+    parentId = opts.parentId;
+  }
+  const reply: Reply = {
+    id: (opts.newId ?? randomUUID)(),
+    body: body.value,
+    author: actor,
+    createdAt: now,
+    updatedAt: now,
+  };
+  if (parentId !== undefined) reply.parentId = parentId;
+  return { ok: true, value: [...existing, reply] };
+}
+
+/**
+ * 删一条回复。回复作者本人可以删,批注作者也可以删(楼层楼主清理自己楼里的回复)。
+ * 只删这一条,不级联删它下面的回复 —— 别人在它下面的发言不该被连带抹掉;
+ * 前端把「找不到父级」的按顶层渲染(见 store.ts 的 Reply.parentId)。
+ */
+export function removeReply(
+  existing: Reply[],
+  replyId: string,
+  actor: Author,
+  isAnnotationOwner: boolean,
+): Validation<Reply[]> {
+  const target = existing.find((r) => r.id === replyId);
+  if (target === undefined) return fail('reply_not_found', '回复不存在或已被删除');
+  if (target.author.githubId !== actor.githubId && !isAnnotationOwner) {
+    return fail('reply_forbidden', '只能删除自己的回复');
+  }
+  return { ok: true, value: existing.filter((r) => r.id !== replyId) };
+}
+
+// ---------------------------------------------------------------------------
+// 点赞
+// ---------------------------------------------------------------------------
+
+/**
+ * 点赞 / 取消点赞。**幂等**:已经赞过再赞、没赞过再取消,都返回原对象
+ * (调用方可用 `next === record` 判断要不要落盘),这样客户端重试不会把计数点乱。
+ *
+ * likes 存 GitHub 数字 id 而不是 login(login 可改);不碰 updatedAt —— 点个赞
+ * 不该让这条批注显示成「刚编辑过」。
+ */
+export function applyLike(
+  record: AnnotationRecord,
+  actor: Author,
+  liked: boolean,
+): AnnotationRecord {
+  const has = record.likes.includes(actor.githubId);
+  if (has === liked) return record;
+  const likes = liked
+    ? [...record.likes, actor.githubId]
+    : record.likes.filter((id) => id !== actor.githubId);
+  return { ...record, likes };
+}
+
+/**
+ * 对外的批注形态。
+ *
+ * 原始记录里的 `likes` 是**点过赞的人的 GitHub id 列表** —— 直接返回等于公开
+ * 「谁赞过」,既是隐私面(能看出谁读了哪一页)又没有展示价值。只回计数与
+ * 「我赞过没」,点赞按钮据此渲染。
+ */
+export function toClientJson(
+  record: AnnotationRecord,
+  actor: Author | null,
+): Omit<AnnotationRecord, 'likes'> & { likeCount: number; likedByMe: boolean } {
+  const { likes, ...rest } = record;
+  return {
+    ...rest,
+    likeCount: likes.length,
+    likedByMe: actor !== null && likes.includes(actor.githubId),
+  };
 }
 
 // ---------------------------------------------------------------------------
