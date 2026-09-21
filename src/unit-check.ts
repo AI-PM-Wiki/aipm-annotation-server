@@ -43,7 +43,7 @@ import {
   toHypothesisExport,
 } from './annotations.ts';
 import { DailyBudget, DailyCounter } from './budget.ts';
-import { SlidingWindowLimiter } from './rate-limit.ts';
+import { SlidingWindowLimiter, mapWithConcurrency } from './rate-limit.ts';
 import { chunkBlocks } from './highlight/blocks.ts';
 import { applyRules, dedupeKey, looksLikeCode, looksLikeNavigation } from './highlight/rules.ts';
 import type { HighlightJudge, JudgeChunkRequest, JudgeOutcome, PaletteEntry, Suggestion } from './highlight/judge.ts';
@@ -1250,6 +1250,29 @@ async function suiteLlm(): Promise<void> {
 async function suiteGuardrails(): Promise<void> {
   section('F. 护栏');
 
+  await test('mapWithConcurrency:保持输入顺序、并发不超过上限', async () => {
+    // 顺序:让先发的任务后完成,结果仍要按输入序返回(上层依赖它做确定性合并)
+    const out = await mapWithConcurrency([30, 10, 20, 1], 2, async (ms) => {
+      await new Promise((r) => setTimeout(r, ms));
+      return ms;
+    });
+    eq(out, [30, 10, 20, 1], '结果顺序与输入一致');
+
+    let inFlight = 0;
+    let peak = 0;
+    await mapWithConcurrency(Array.from({ length: 9 }, (_, i) => i), 3, async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      return null;
+    });
+    eq(peak, 3, '并发度用满上限且不超');
+
+    eq(await mapWithConcurrency([], 4, async () => 1), [], '空输入返回空');
+    eq(await mapWithConcurrency([1, 2], 99, async (x) => x * 2), [2, 4], '上限大于任务数时不报错');
+  });
+
   await test('DailyBudget 预占-结算-释放与跨日重置', () => {
     let day = new Date('2026-09-20T00:00:00.000Z');
     const budget = new DailyBudget(1, () => day);
@@ -2106,6 +2129,54 @@ async function suiteHttpJudge(): Promise<void> {
         '失败的片计入 degraded',
       );
       eq(h.llm.calls, 2, '两个片各调用一次 provider(失败片的内部重试在 E2 覆盖)');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('多片并发跑(不串行),且结果按片序确定性合并', async () => {
+    const concPage = '/ai/conc/';
+    const sentences = [
+      '分块粒度决定了检索召回的上限与噪声水平。',
+      '向量召回之后叠一层重排能显著提升命中率。',
+      '提示词里的示例数量比措辞更影响稳定性。',
+      '把长文档按标题层级切片能保住语义完整性。',
+      '评测集要覆盖真实问答分布而非只放简单问句。',
+      '缓存同页结果能避免重复点击带来的重复计费。',
+    ];
+    // TYPESAFE_API_KEY 必须给:makeHarness 默认只有 ANTHROPIC_API_KEY,
+    // 不给的话 jev.available=false,判分走的是 LLM 的默认 handler。
+    const h = await makeHarness({
+      TYPESAFE_API_KEY: 'sk-test',
+      HIGHLIGHT_CHUNK_BLOCKS: '1',
+      HIGHLIGHT_CHUNK_CHARS: '100000',
+      HIGHLIGHT_CHUNK_CONCURRENCY: '3',
+    });
+    try {
+      h.index.pages.set(concPage, sentences.map((s) => `<p>${s}</p>`).join(''));
+      let inFlight = 0;
+      let peak = 0;
+      h.jev.handler = async (req) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 25));
+        inFlight--;
+        // 每片只回它自己那一块的建议:id 取自片内,顺序错位会立刻暴露
+        return { suggestions: req.chunk.blocks.map((b) => suggestion(b.id)) };
+      };
+      const blocks = sentences.map((text, i) => ({ id: `c${i}`, text }));
+      const res = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: concPage, palette: PALETTE, blocks }),
+      });
+      eq(res.status, 200, '应 200');
+      eq(h.jev.calls, 6, '6 块 / 每片 1 块 = 6 次调用');
+      eq(peak, 3, '并发度用满 HIGHLIGHT_CHUNK_CONCURRENCY');
+      eq(
+        res.body.suggestions.map((s: { id: string }) => s.id),
+        ['c0', 'c1', 'c2', 'c3', 'c4', 'c5'],
+        '合并顺序与片序一致(与串行结果相同)',
+      );
     } finally {
       await h.close();
     }

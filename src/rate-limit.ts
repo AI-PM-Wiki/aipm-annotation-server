@@ -12,6 +12,38 @@ export function hashIp(ip: string): string {
   return createHash('sha256').update(ip).digest('hex');
 }
 
+/**
+ * 有界并发 map:最多 limit 个任务同时在跑,返回值顺序与输入一致。
+ *
+ * 与 Semaphore 的分工:信号量管「准入」(会排队、会超时、会被拒绝),这里只负责
+ * 把一批**已知互不依赖**的任务分给固定几个工人跑完 —— 分片之间没有依赖,谁先
+ * 返回都不影响结果,所以不需要排队与超时语义,只需要一个并发上限。
+ * 顺序被保住是为了让上层能按原序合并,使并发与串行的结果逐字节一致。
+ *
+ * 注意:fn 抛出时 Promise.all 会立即 reject;其余在跑的任务不会被取消(JS 没有
+ * 协程取消),它们的结果被丢弃。调用方应保证 fn 自己消化业务错误(本仓库的用法
+ * 就是这样:单片失败转成 degraded,不抛)。
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  if (items.length === 0) return out;
+  const workers = Math.max(1, Math.min(Math.floor(limit) || 1, items.length));
+  let cursor = 0;
+  const run = async (): Promise<void> => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]!, i);
+    }
+  };
+  await Promise.all(Array.from({ length: workers }, () => run()));
+  return out;
+}
+
 export class SlidingWindowLimiter {
   private readonly hits = new Map<string, number[]>();
   private readonly max: number;

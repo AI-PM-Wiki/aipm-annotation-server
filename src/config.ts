@@ -36,6 +36,8 @@ export interface HighlightConfig {
   /** 服务端分片:每片块数与字符数取小者。 */
   chunkBlocks: number;
   chunkChars: number;
+  /** 片间并发上限(片之间无依赖;串行会让长页撞代理超时)。 */
+  chunkConcurrency: number;
   /** 每页最多下发多少条建议(按 importance 排序截断)。 */
   maxSuggestionsPerPage: number;
 
@@ -187,10 +189,16 @@ const EnvSchema = z.object({
   HIGHLIGHT_MAX_TOKENS: z.coerce.number().int().min(256).max(64_000).default(8_000),
   HIGHLIGHT_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(600_000).default(60_000),
 
-  HIGHLIGHT_MAX_BLOCKS: z.coerce.number().int().min(1).max(2_000).default(120),
-  HIGHLIGHT_MAX_CHARS: z.coerce.number().int().min(200).max(400_000).default(24_000),
+  // 每请求硬上限(超限 400)。取值依据:2026-09 实测全站 601 页,最长的正文是
+  // 654 块 / 29,639 字符(pm/monetization、tools/frameworks 那几页),按两倍留冗余。
+  // 两个上限必须一起抬 —— 只抬块数会让字符数本就超限的页面从「被截断」变成「400」。
+  HIGHLIGHT_MAX_BLOCKS: z.coerce.number().int().min(1).max(2_000).default(1_308),
+  HIGHLIGHT_MAX_CHARS: z.coerce.number().int().min(200).max(400_000).default(60_000),
   HIGHLIGHT_CHUNK_BLOCKS: z.coerce.number().int().min(1).max(500).default(40),
   HIGHLIGHT_CHUNK_CHARS: z.coerce.number().int().min(200).max(200_000).default(8_000),
+  // 片间并发:片之间没有依赖,但串行跑 17 片会让最长的几页超过 Cloudflare 的
+  // ~100s 代理超时(524),而那几页恰恰是抬上限要覆盖的对象。
+  HIGHLIGHT_CHUNK_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
   HIGHLIGHT_MAX_SUGGESTIONS: z.coerce.number().int().min(1).max(500).default(12),
 
   // 判分限流:匿名可用,按 IP;比批注接口严(一次判分 = 一次真金白银的模型调用)。
@@ -199,12 +207,15 @@ const EnvSchema = z.object({
 
   // 判分每日护栏(独立于问答服务:两个服务独立部署、各自计价与对账)。
   HIGHLIGHT_DAILY_BUDGET_USD: z.coerce.number().min(0).default(0.5),
-  HIGHLIGHT_DAILY_CALLS_JEV: z.coerce.number().int().min(0).default(300),
+  // 一次点击会按片数计次:最长的页面 17 片 = 17 次调用,300 次/日只够约 17 次点击。
+  HIGHLIGHT_DAILY_CALLS_JEV: z.coerce.number().int().min(0).default(1_200),
   HIGHLIGHT_DAILY_CALLS_LLM: z.coerce.number().int().min(0).default(200),
   LLM_INPUT_COST_PER_MTOK: z.coerce.number().min(0).default(1),
   LLM_OUTPUT_COST_PER_MTOK: z.coerce.number().min(0).default(5),
-  // Jev early access 计价未公开:默认 0(只记 token,不计费),拿到报价再填。
-  JEV_INPUT_COST_PER_MTOK: z.coerce.number().min(0).default(0),
+  // Jev 的公开费率(USD / 百万输入 token):$42/Btok = $0.042/Mtok,输出免费,
+  // 见 https://docs.typesafe.ai/models.md。此前默认 0(当时以为计价未公开),
+  // 那会让日预算护栏对 Jev 完全失效 —— 只剩调用次数上限在兜底。
+  JEV_INPUT_COST_PER_MTOK: z.coerce.number().min(0).default(0.042),
 
   HIGHLIGHT_CACHE_TTL_MS: z.coerce.number().int().min(0).default(900_000),
   HIGHLIGHT_CACHE_MAX_ENTRIES: z.coerce.number().int().min(0).max(10_000).default(200),
@@ -324,6 +335,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       maxCharsPerRequest: e.HIGHLIGHT_MAX_CHARS,
       chunkBlocks: e.HIGHLIGHT_CHUNK_BLOCKS,
       chunkChars: e.HIGHLIGHT_CHUNK_CHARS,
+      chunkConcurrency: e.HIGHLIGHT_CHUNK_CONCURRENCY,
       maxSuggestionsPerPage: e.HIGHLIGHT_MAX_SUGGESTIONS,
 
       rateLimitMax: e.HIGHLIGHT_RATE_LIMIT_MAX,

@@ -16,7 +16,12 @@
  */
 import { DailyBudget, DailyCounter } from '../budget.ts';
 import type { Config } from '../config.ts';
-import { SlidingWindowLimiter, Semaphore, SemaphoreError } from '../rate-limit.ts';
+import {
+  SlidingWindowLimiter,
+  Semaphore,
+  SemaphoreError,
+  mapWithConcurrency,
+} from '../rate-limit.ts';
 import { canonicalPage, hashPageText, verifyBlocks } from '../index-store.ts';
 import { chunkBlocks } from './blocks.ts';
 import type {
@@ -73,6 +78,19 @@ export interface HighlightServiceDeps {
   judges: { jev: HighlightJudge; llm: HighlightJudge };
   index: PageIndexLike;
   now?: () => number;
+}
+
+/** 单片判分的完整结果;请求级累加器由调用方按片序合并。 */
+interface ChunkOutcome {
+  /** null = 该片没拿到任何有效建议(原因已写进 degraded)。 */
+  suggestions: Suggestion[] | null;
+  costUsd: number;
+  degraded: DegradedBlock[];
+  usedFallbackFrom: 'jev' | 'llm' | null;
+  effective: 'jev' | 'llm' | null;
+  budgetBlocked: boolean;
+  model?: string;
+  usage?: JudgeUsage;
 }
 
 interface CacheEntry {
@@ -295,6 +313,151 @@ export class HighlightService {
   }
 
   /**
+   * 单片:预算预占 → 主选(必要时兜底)→ 结算,返回这一片的结果。
+   *
+   * 片内逻辑与请求级累加器分开,是为了让多片能并发跑:片之间本来就没有依赖,
+   * 抽出结果后由调用方**按片序**合并,于是并发与串行的产出逐字节一致
+   * (degraded 的顺序、effective / usedFallbackFrom 的取值都不会漂)。
+   */
+  private async judgeOneChunk(
+    chunk: Chunk,
+    available: Array<'jev' | 'llm'>,
+    raw: HighlightRequest,
+    page: string,
+    title: string,
+    totalChunks: number,
+    signal?: AbortSignal,
+  ): Promise<ChunkOutcome> {
+    const h = this.config.highlight;
+    const first = available[0]!;
+    const second = available[1];
+    const degraded: DegradedBlock[] = [];
+    let costUsd = 0;
+    let usedFallbackFrom: 'jev' | 'llm' | null = null;
+    let effective: 'jev' | 'llm' | null = null;
+    let budgetBlocked = false;
+
+    /** 本片当前未结算的预占额(0 = 无未结预占)。 */
+    let reserved = this.estimateCost(first, chunk);
+    if (!this.budget.tryReserve(reserved)) {
+      for (const b of chunk.blocks) degraded.push({ id: b.id, reason: 'budget_exhausted' });
+      return {
+        suggestions: null,
+        costUsd: 0,
+        degraded,
+        usedFallbackFrom: null,
+        effective: null,
+        budgetBlocked: true,
+      };
+    }
+
+    let chunkSuggestions: Suggestion[] | null = null;
+    let chunkUsage: JudgeUsage | undefined;
+    let chunkModel: string | undefined;
+    /** 主选回了低置信但有效的结果:兜底也失败时用它,别把已有的答案丢掉。 */
+    let pendingLowConfidence: { suggestions: Suggestion[]; model?: string } | null = null;
+    let failureReason = 'unknown';
+
+    for (let i = 0; i < available.length; i++) {
+      const name = available[i]!;
+      const isFallback = i > 0;
+      // 换 provider 要按新 provider 的估价调整预占(只动差额,避免误释放别人的预占)
+      const estimate = this.estimateCost(name, chunk);
+      if (estimate > reserved) {
+        const delta = estimate - reserved;
+        if (!this.budget.tryReserve(delta)) {
+          this.budget.release(reserved);
+          reserved = 0;
+          budgetBlocked = true;
+          failureReason = 'budget_exhausted';
+          break;
+        }
+        reserved = estimate;
+      } else if (estimate < reserved) {
+        this.budget.release(reserved - estimate);
+        reserved = estimate;
+      }
+
+      try {
+        const outcome = await this.judgeChunk(
+          name,
+          { ...raw, page, title },
+          chunk,
+          totalChunks,
+          signal,
+        );
+        this.budget.settle(reserved, outcome.costUsd);
+        reserved = 0;
+        costUsd += outcome.costUsd;
+        if (outcome.model !== undefined) chunkModel = outcome.model;
+        if (outcome.usage !== undefined) chunkUsage = outcome.usage;
+        this.logCall(
+          name,
+          chunk,
+          outcome.usage,
+          outcome.costUsd,
+          page,
+          isFallback ? 'fallback' : 'ok',
+        );
+
+        const confidence = chunkConfidence(outcome.suggestions);
+        if (
+          !isFallback &&
+          second !== undefined &&
+          confidence !== null &&
+          confidence < h.fallbackThreshold
+        ) {
+          // Jev 回得低置信:先留底,再试兜底(阈值只对有原生置信度的 provider 生效)
+          pendingLowConfidence = { suggestions: outcome.suggestions };
+          if (outcome.model !== undefined) pendingLowConfidence.model = outcome.model;
+          failureReason = `low_confidence(${confidence.toFixed(2)})`;
+          this.logCall(name, chunk, outcome.usage, 0, page, 'low_confidence');
+          continue;
+        }
+        chunkSuggestions = outcome.suggestions;
+        effective = name;
+        if (isFallback) usedFallbackFrom = first;
+        break;
+      } catch (err) {
+        const judgeErr = err instanceof JudgeError ? err : new JudgeError('http', String(err));
+        const consumed = judgeErr.usage?.costUsd ?? 0;
+        this.budget.settle(reserved, consumed);
+        reserved = 0;
+        costUsd += consumed;
+        failureReason = `${judgeErr.code}:${judgeErr.message}`;
+        this.logCall(name, chunk, judgeErr.usage, consumed, page, `error:${judgeErr.code}`);
+        if (signal?.aborted === true) break; // 客户端已断开,别再花钱
+      }
+    }
+
+    if (reserved > 0) {
+      this.budget.release(reserved);
+      reserved = 0;
+    }
+    if (chunkSuggestions === null && pendingLowConfidence !== null) {
+      // 兜底没成功,但主选当时是有有效答案的(只是置信度低)——保留它
+      chunkSuggestions = pendingLowConfidence.suggestions;
+      if (pendingLowConfidence.model !== undefined) chunkModel = pendingLowConfidence.model;
+      effective = first;
+    }
+    if (chunkSuggestions === null) {
+      for (const b of chunk.blocks) degraded.push({ id: b.id, reason: failureReason });
+    }
+
+    const result: ChunkOutcome = {
+      suggestions: chunkSuggestions,
+      costUsd,
+      degraded,
+      usedFallbackFrom,
+      effective,
+      budgetBlocked,
+    };
+    if (chunkUsage !== undefined) result.usage = chunkUsage;
+    if (chunkModel !== undefined) result.model = chunkModel;
+    return result;
+  }
+
+  /**
    * 主入口。限流在最外层(命中缓存则不消耗配额 —— 同页重复点击正是「误触连点」的
    * 常见形态,不该把它打成 429);预算按片预占-结算,失败也把已产生的用量算进去。
    */
@@ -389,123 +552,41 @@ export class HighlightService {
       let succeeded = 0;
       let budgetBlocked = false;
 
-      for (const chunk of chunks) {
-        const first = available[0]!;
-        const second = available[1];
-        /** 本片当前未结算的预占额(0 = 无未结预占)。 */
-        let reserved = this.estimateCost(first, chunk);
-        if (!this.budget.tryReserve(reserved)) {
-          budgetBlocked = true;
-          for (const b of chunk.blocks) degraded.push({ id: b.id, reason: 'budget_exhausted' });
-          continue;
+      /* 片之间没有依赖,按 chunkConcurrency 并发跑;结果按片序合并,与串行语义一致。
+         串行版本在最长的那几页(17 片)会超过 Cloudflare ~100s 的代理超时。 */
+      const outcomes = await mapWithConcurrency(chunks, h.chunkConcurrency, (chunk) =>
+        this.judgeOneChunk(chunk, available, raw, page, title, chunks.length, signal),
+      );
+
+      for (let i = 0; i < outcomes.length; i++) {
+        const outcome = outcomes[i]!;
+        const chunk = chunks[i]!;
+        requestCostUsd += outcome.costUsd;
+        if (outcome.budgetBlocked) budgetBlocked = true;
+        if (outcome.usedFallbackFrom !== null) usedFallbackFrom = outcome.usedFallbackFrom;
+        if (outcome.effective !== null) effective = outcome.effective;
+        if (outcome.model !== undefined) model = outcome.model;
+        if (outcome.usage !== undefined) {
+          usage.inputTokens = (usage.inputTokens ?? 0) + (outcome.usage.inputTokens ?? 0);
+          usage.outputTokens = (usage.outputTokens ?? 0) + (outcome.usage.outputTokens ?? 0);
         }
+        for (const d of outcome.degraded) degraded.push(d);
 
-        let chunkSuggestions: Suggestion[] | null = null;
-        let chunkUsage: JudgeUsage | undefined;
-        let chunkModel: string | undefined;
-        /** 主选回了低置信但有效的结果:兜底也失败时用它,别把已有的答案丢掉。 */
-        let pendingLowConfidence: { suggestions: Suggestion[]; model?: string } | null = null;
-        let failureReason = 'unknown';
-
-        for (let i = 0; i < available.length; i++) {
-          const name = available[i]!;
-          const isFallback = i > 0;
-          // 换 provider 要按新 provider 的估价调整预占(只动差额,避免误释放别人的预占)
-          const estimate = this.estimateCost(name, chunk);
-          if (estimate > reserved) {
-            const delta = estimate - reserved;
-            if (!this.budget.tryReserve(delta)) {
-              this.budget.release(reserved);
-              reserved = 0;
-              budgetBlocked = true;
-              failureReason = 'budget_exhausted';
-              break;
-            }
-            reserved = estimate;
-          } else if (estimate < reserved) {
-            this.budget.release(reserved - estimate);
-            reserved = estimate;
-          }
-
-          try {
-            const outcome = await this.judgeChunk(
-              name,
-              { ...raw, page, title },
-              chunk,
-              chunks.length,
-              signal,
-            );
-            this.budget.settle(reserved, outcome.costUsd);
-            reserved = 0;
-            requestCostUsd += outcome.costUsd;
-            if (outcome.model !== undefined) chunkModel = outcome.model;
-            if (outcome.usage !== undefined) chunkUsage = outcome.usage;
-            this.logCall(name, chunk, outcome.usage, outcome.costUsd, page, isFallback ? 'fallback' : 'ok');
-
-            const confidence = chunkConfidence(outcome.suggestions);
-            if (
-              !isFallback &&
-              second !== undefined &&
-              confidence !== null &&
-              confidence < h.fallbackThreshold
-            ) {
-              // Jev 回得低置信:先留底,再试兜底(阈值只对有原生置信度的 provider 生效)
-              pendingLowConfidence = { suggestions: outcome.suggestions };
-              if (outcome.model !== undefined) pendingLowConfidence.model = outcome.model;
-              failureReason = `low_confidence(${confidence.toFixed(2)})`;
-              this.logCall(name, chunk, outcome.usage, 0, page, 'low_confidence');
-              continue;
-            }
-            chunkSuggestions = outcome.suggestions;
-            effective = name;
-            if (isFallback) usedFallbackFrom = first;
-            break;
-          } catch (err) {
-            const judgeErr = err instanceof JudgeError ? err : new JudgeError('http', String(err));
-            const consumed = judgeErr.usage?.costUsd ?? 0;
-            this.budget.settle(reserved, consumed);
-            reserved = 0;
-            requestCostUsd += consumed;
-            failureReason = `${judgeErr.code}:${judgeErr.message}`;
-            this.logCall(name, chunk, judgeErr.usage, consumed, page, `error:${judgeErr.code}`);
-            if (signal?.aborted === true) break; // 客户端已断开,别再花钱
+        if (outcome.suggestions === null) continue; // 片内已把失败原因写进 degraded
+        succeeded++;
+        for (const s of outcome.suggestions) {
+          if (
+            s.worth >= h.worthThreshold &&
+            (s.confidence === null || s.confidence >= h.fallbackThreshold)
+          ) {
+            suggestions.push(s);
+          } else {
+            degraded.push({ id: s.id, reason: 'below_threshold' });
           }
         }
-
-        if (reserved > 0) {
-          this.budget.release(reserved);
-          reserved = 0;
-        }
-        if (chunkSuggestions === null && pendingLowConfidence !== null) {
-          // 兜底没成功,但主选当时是有有效答案的(只是置信度低)——保留它
-          chunkSuggestions = pendingLowConfidence.suggestions;
-          if (pendingLowConfidence.model !== undefined) chunkModel = pendingLowConfidence.model;
-          effective = first;
-        }
-        if (chunkUsage !== undefined) {
-          usage.inputTokens = (usage.inputTokens ?? 0) + (chunkUsage.inputTokens ?? 0);
-          usage.outputTokens = (usage.outputTokens ?? 0) + (chunkUsage.outputTokens ?? 0);
-        }
-        if (chunkModel !== undefined) model = chunkModel;
-
-        if (chunkSuggestions === null) {
-          for (const b of chunk.blocks) degraded.push({ id: b.id, reason: failureReason });
-        } else {
-          succeeded++;
-          for (const s of chunkSuggestions) {
-            if (
-              s.worth >= h.worthThreshold &&
-              (s.confidence === null || s.confidence >= h.fallbackThreshold)
-            ) {
-              suggestions.push(s);
-            } else {
-              degraded.push({ id: s.id, reason: 'below_threshold' });
-            }
-          }
-          for (const b of chunk.blocks) {
-            if (!chunkSuggestions.some((s) => s.id === b.id)) {
-              degraded.push({ id: b.id, reason: 'no_answer' });
-            }
+        for (const b of chunk.blocks) {
+          if (!outcome.suggestions.some((s) => s.id === b.id)) {
+            degraded.push({ id: b.id, reason: 'no_answer' });
           }
         }
       }

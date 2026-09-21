@@ -173,17 +173,39 @@ npm run dev           # tsx 直跑,读 .env
   OAuth App 的回调地址必须与 `OAUTH_CALLBACK_URL` 完全一致。
 - `TYPESAFE_API_KEY`(主判分)/ `ANTHROPIC_API_KEY`(兜底判分):都可选。
   **两个都没有时智能高亮返回 503 `highlight_unavailable`,批注主功能不受影响。**
+  LLM 兜底要**真正的 Anthropic key**(`sk-ant-`):本服务没有 `ANTHROPIC_BASE_URL`
+  覆盖项,只会打 `api.anthropic.com`,且走 `output_config.format` 结构化输出,
+  第三方兼容端点(如 DeepSeek 的 anthropic 兼容层)用不了。没有真 key 就把
+  `HIGHLIGHT_JUDGE_FALLBACK=none` 只跑 Jev —— 主判分器本来就是 Jev。
+- `JEV_INPUT_COST_PER_MTOK`:Jev 的公开费率 `$42/Btok = $0.042/Mtok`(输出免费,
+  见 <https://docs.typesafe.ai/models.md>)。它进成本日志与日预算预占;填 0 会让
+  金额护栏对 Jev 完全失效,只剩调用次数上限兜底。
 - `ALLOWED_ORIGINS`(站点与本地预览)、`RETURN_ORIGINS`(OAuth 回跳白名单,留空同上)。
-- `TRUST_PROXY`:隧道部署必须为 `true`,否则限流取不到真实客户端 IP。
+- `TRUST_PROXY`:隧道部署必须为 `true`,**且 `TRUSTED_PROXY_IPS` 必须包含 docker
+  网桥网关**。容器内看到的直连来源是网桥网关(本服务 compose 固定为 `172.30.0.1`),
+  不是 `127.0.0.1`;只写回环的话 `cf-connecting-ip` 被整条忽略、回落到 socket 地址,
+  于是**所有请求算同一个 IP**,每 IP 限流退化成全站共享一个桶。自查:`docker logs`
+  里出现 `untrusted_proxy_ignored` 就是没配上。
 - `DATA_DIR`:存储目录,必须持久化(compose 里挂 `./data:/data`)。
 - `HIGHLIGHT_DAILY_BUDGET_USD` / `HIGHLIGHT_DAILY_CALLS_*`:预算与调用上限,`0` = 关闭。
+  注意**调用次数按片计**:最长页面 17 片 = 17 次调用,所以日上限要按片数而不是按
+  点击数来估。
+- `HIGHLIGHT_MAX_BLOCKS` / `HIGHLIGHT_MAX_CHARS` / `HIGHLIGHT_CHUNK_CONCURRENCY`:
+  每请求块数与字符数硬上限、片间并发。取值依据见 `.env.example` 的注释(实测 601 页
+  最长 654 块 / 29,639 字符,按两倍留冗余)。**片间并发不是性能优化而是可用性要求**:
+  串行跑 17 片会超过 Cloudflare ~100s 的代理超时,而那几页正是抬上限要覆盖的对象。
 
 ## 部署(与 agent-server 同拓扑,端口不同)
 
 1. `cp .env.example .env` 并填密钥。
-2. `docker compose up -d --build`(绑回环 `127.0.0.1:8788`,数据落 `./data`)。
-3. Cloudflare Zero Trust 隧道 ingress 加一条 public hostname 指向 `http://127.0.0.1:8788`。
-4. `curl https://<该 hostname>/healthz` 验证。
+2. `.env` 里 **`HOST` 必须是容器内可绑定的地址**。`.env.example` 给的是
+   `HOST=0.0.0.0`(容器内有意义,宿主仍只绑回环):容器内若绑自身回环,compose 的
+   `127.0.0.1:8788` 端口映射连不进去,表现为「容器内 healthz 健康、外面 502」。
+3. `docker compose up -d --build`(绑回环 `127.0.0.1:8788`,数据落 `./data`)。
+4. Cloudflare Zero Trust 隧道 ingress 加一条 public hostname 指向 `http://127.0.0.1:8788`
+   (线上用 `anno-api.nvc.ac`;前端 `annotation-store.js` 里写死了这个域名,
+   换域名要连它一起改)。
+5. `curl https://anno-api.nvc.ac/healthz` 验证。
 
 `/healthz` 会返回索引状态、批注/会话条数、并发水位,以及判分路由与当日预算水位。
 

@@ -146,7 +146,11 @@ export function createApp(deps: ServerDeps) {
 
   function clientIp(req: IncomingMessage): string {
     if (config.trustProxy && config.trustedProxyIps.includes(req.socket.remoteAddress ?? '')) {
-      for (const header of ['fly-client-ip', 'cf-connecting-ip'] as const) {
+      // 顺序要紧:本服务部署在 Cloudflare 隧道后面,`cf-connecting-ip` 由 CF 覆写、
+      // 客户端伪造不了;而 `fly-client-ip` 是 Fly.io 的头,CF **不会**碰它,客户端
+      // 自己发什么就透传什么 —— 放在前面等于给每个请求一个可自选的限流桶。
+      // 保留它只为万一换到 Fly 部署(那时 cf-connecting-ip 不存在,自然落到它)。
+      for (const header of ['cf-connecting-ip', 'fly-client-ip'] as const) {
         const forwarded = req.headers[header];
         if (typeof forwarded === 'string' && forwarded.length > 0) {
           return forwarded.split(',')[0]!.trim();

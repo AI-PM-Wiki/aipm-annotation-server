@@ -30,6 +30,11 @@ services:
           memory: 1024M
     ports:
       - "127.0.0.1:8788:8788"
+    # 网络子网必须固定:容器内看到的直连来源是网桥**网关**,而 .env 的
+    # TRUSTED_PROXY_IPS 要按它来配(见 .env.example)。交给 Docker 自动分配
+    # 的话,网关地址会随机器上已有网络的占用顺序漂移。
+    networks:
+      - default
     volumes:
       # 批注 / 会话 / 用户快照落在这里:必须持久化,否则重启丢数据与登录态
       - ./data:/data
@@ -39,6 +44,13 @@ services:
       timeout: 5s
       start_period: 45s
       retries: 3
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
 
   # cloudflared 停用:本机隧道由系统级 cloudflared(ai-gateway 隧道,
   # /etc/cloudflared/config.yml 本地 ingress)负责,无需 token 容器。
