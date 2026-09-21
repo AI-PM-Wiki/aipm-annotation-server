@@ -736,7 +736,9 @@ export function createApp(deps: ServerDeps) {
       const headers: Record<string, string> = { Vary: 'Origin', 'Content-Length': '0' };
       if (origin !== undefined) {
         headers['Access-Control-Allow-Origin'] = origin;
-        headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, DELETE, OPTIONS';
+        // PUT 是点赞要用的;漏一个方法,预检就把整个请求挡在门外,页面只看到
+        // 一个 status 0,排查时完全不指向这里
+        headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS';
         // Authorization 与 X-API-Key 必须显式放行,否则跨源请求连预检都过不去
         headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-API-Key';
         headers['Access-Control-Max-Age'] = '86400';

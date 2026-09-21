@@ -1802,6 +1802,20 @@ async function suiteHttpAuth(): Promise<void> {
       eq(outside.headers.get('access-control-allow-origin'), null, '白名单外不给 ACAO');
     });
 
+    await test('预检放行点赞用的 PUT', async () => {
+      // 漏一个方法,浏览器预检就把整个请求挡在门外,页面只拿到一个 status 0
+      // (前端显示「点赞失败:0」),排查时完全不指向 CORS。
+      const res = await api(h, '/api/annotations/x/like', {
+        method: 'OPTIONS',
+        headers: { Origin: 'https://aipm.ac', 'Access-Control-Request-Method': 'PUT' },
+      });
+      eq(res.status, 204, '预检 204');
+      ok(
+        (res.headers.get('access-control-allow-methods') || '').includes('PUT'),
+        'PUT 必须在允许的方法里',
+      );
+    });
+
     await test('导出:只含公开 + 本人私有', async () => {
       const alice = await loginAs(h, 'code-alice');
       const bob = await loginAs(h, 'code-bob');
