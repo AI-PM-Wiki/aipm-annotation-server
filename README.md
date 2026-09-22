@@ -28,6 +28,8 @@
 - 他人读我的私有批注一律返回 **404 而不是 403** —— 不泄露「这里有一条你看不到的批注」。
 - **版主(`MODERATOR_LOGINS`)只多一项「删除公开批注」的能力**:不能读他人私有批注,
   也不能改写任何人的内容。治理能力与阅读权限是两回事。
+- **站长(`ADMIN_LOGINS`)只多一项「重新生成智能高亮」的能力**:跳过同页缓存重新判分。
+  它与版主是两份名单,互不蕴含。
 - 列表接口按登录身份过滤:未登录只能拿 `scope=public`,`scope=mine` 必须登录。
 
 ## 鉴权
@@ -117,7 +119,8 @@ GET    /api/annotations/export?page=<path>                # hypothes.is JSON 兼
 
 ```
 POST /api/highlight/suggest
-  { page, title, palette:[{id,label,when}], blocks:[{id,text}], judge?:"auto"|"jev"|"llm" }
+  { page, title, palette:[{id,label,when}], blocks:[{id,text}], judge?:"auto"|"jev"|"llm",
+    refresh?:boolean }
 → { judge, fallbackFrom?, model?, suggestions[], degraded[], usage?, cached? }
 ```
 
@@ -133,6 +136,18 @@ POST /api/highlight/suggest
   费用写进服务端日志便于对账;同页结果缓存(重复点击不重复计费)。
 - 结果**只作建议**:预览 + 单条采纳 + 全部采纳,不静默写入批注数据。
   **批注主功能(选中高亮、写批注)在任何情况下都不依赖 judge。**
+
+### 重新生成(站长)
+
+同页缓存默认优先:这一页判过就摆那一份,连服务端都不再问 provider。要换一份就得
+显式要求 —— `refresh: true` 跳过缓存读、重新判分,并把新结果覆盖回同一格缓存。
+
+它是整站唯一会为同一页重复花钱的通路,所以单独设闸:**需登录,且 login 在
+`ADMIN_LOGINS` 里**(未登录 401、非站长 403)。前端对应的是面板页头那支笔 ——
+只有站长手上它才是一颗开关,其余人看到的是一枚静态图标。
+
+绕开的只有缓存那一层:限流、并发与日预算仍在它后面,一次重新生成照样计费。
+判分失败时旧缓存原样留着,下一位访客拿到的仍是那份可用结果。
 
 ### 两个 provider
 
@@ -164,14 +179,15 @@ confidence 回退。这条是 2026-09-22 按实测改的:原先「本片建议�
 ```bash
 npm install
 npm run typecheck     # 类型检查
-npm run unit-check    # 单元检查(101 项;外部依赖全部注入 fake,不联网)
+npm run unit-check    # 单元检查(106 项;外部依赖全部注入 fake,不联网)
 npm run build         # 产出 dist/
 npm run dev           # tsx 直跑,读 .env
 ```
 
 `unit-check` 覆盖纯函数(分块、规则、索引抽样、回复合并、return 白名单、预算跨日)、
 两个 provider 的适配与降级、以及端到端 HTTP 语义(三态可见性、归属 401/403/404、
-限流与预算、回退与缓存(含落盘后重启复用)、LLM 兜底的两种线上格式(结构化输出 / 抠 JSON))。当前 101 项。
+限流与预算、回退与缓存(含落盘后重启复用)、重新生成的两条拒绝路径与缓存覆盖、
+LLM 兜底的两种线上格式(结构化输出 / 抠 JSON))。当前 106 项。
 
 ## 配置
 
@@ -206,6 +222,8 @@ npm run dev           # tsx 直跑,读 .env
   于是**所有请求算同一个 IP**,每 IP 限流退化成全站共享一个桶。自查:`docker logs`
   里出现 `untrusted_proxy_ignored` 就是没配上。
 - `DATA_DIR`:存储目录,必须持久化(compose 里挂 `./data:/data`)。
+- `ADMIN_LOGINS`:站长名单(逗号分隔,默认 `huangyincan`),决定谁能重新生成智能高亮。
+  它与 `MODERATOR_LOGINS` 是两份独立名单。
 - `HIGHLIGHT_DAILY_BUDGET_USD` / `HIGHLIGHT_DAILY_CALLS_*`:预算与调用上限,`0` = 关闭。
   注意**调用次数按片计**:最长页面 17 片 = 17 次调用,所以日上限要按片数而不是按
   点击数来估。
@@ -255,7 +273,7 @@ await fetch('http://127.0.0.1:8788/api/auth/dev', { method: 'POST' })
 - 不做批注分享/协作(私有批注只做「本人跨设备可见」)、不做通知订阅、不做
   hypothes.is 历史数据迁移(只提供兼容导出)。
 - `MODERATOR_LOGINS` 只能删**公开**批注,看不到也不动私有批注 —— 版主权限不越
-  隐私边界。
+  隐私边界。`ADMIN_LOGINS` 只在智能高亮那条路上多一项重新生成。
 - `/healthz` 是监控端点,刻意不带 CORS 头(它是给探测用的,不该被页面脚本读)。
   真实登录走 `/api/auth/github/start` 的整页跳转,不受影响。
 - 智能高亮的同页缓存 key 是「页面 + 正文哈希 + judge + 色板版本」。页面正文没变
@@ -263,3 +281,5 @@ await fetch('http://127.0.0.1:8788/api/auth/dev', { method: 'POST' })
   各客户端的 id↔段落映射因此一致,缓存结果不会被错配到别的段落上。缓存在
   `DATA_DIR/highlight-cache.json` 落盘(TTL 默认 7 天、上限 800 条、原子写),
   重启与重新部署都接着用 —— 一次判分的结果不该只有它自己那一轮进程受益。
+  `refresh: true`(站长)跳过读缓存并覆盖同一格,所以「缓存优先」与「重新生成」
+  合起来正好是这份缓存的完整生命周期。

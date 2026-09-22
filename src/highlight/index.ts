@@ -49,6 +49,12 @@ export interface HighlightRequest {
   palette: PaletteEntry[];
   blocks: JudgeBlock[];
   judge: 'auto' | 'jev' | 'llm';
+  /**
+   * 重新生成:跳过同页缓存直接判分,并把新结果覆盖回缓存。
+   * 它不是缓存 key 的一部分 —— 重新生成写的仍是同一页那一格,否则每点一次就会
+   * 多留一份同页结果,后面的访客命中哪一份全看插入顺序。
+   */
+  refresh?: boolean;
 }
 
 export interface DegradedBlock {
@@ -588,6 +594,10 @@ export class HighlightService {
   /**
    * 主入口。限流在最外层(命中缓存则不消耗配额 —— 同页重复点击正是「误触连点」的
    * 常见形态,不该把它打成 429);预算按片预占-结算,失败也把已产生的用量算进去。
+   *
+   * `refresh` 跳过缓存读,照常走限流与预算:重新生成要再花一次钱,它不该绕开护栏。
+   * 判分失败时旧缓存原样留着 —— 一次失败的重新生成没有理由把手上那份可用的结果
+   * 抹掉。
    */
   async suggest(
     raw: HighlightRequest,
@@ -615,8 +625,10 @@ export class HighlightService {
     const contentHash = hashPageText(this.index.pageText(page));
     const key = this.cacheKey(page, contentHash, raw);
     const wanted = new Set(blocks.map((b) => b.id));
-    const hit = this.readCache(key, wanted);
-    if (hit !== null) return { ok: true, body: hit };
+    if (raw.refresh !== true) {
+      const hit = this.readCache(key, wanted);
+      if (hit !== null) return { ok: true, body: hit };
+    }
 
     /* 校验阶段丢掉的块先入 degraded:它们不是这一页的正文(页脚模板文字之类),
        用户能在「N 段未判定」里看到,而不是被静默吞掉。 */
@@ -692,7 +704,13 @@ export class HighlightService {
 
       /* 交给 provider 的请求只带验过的块 —— providers 只读 chunk,但别留下一条能
          把未校验文本漏进请求对象的路。 */
-      const judged: HighlightRequest = { ...raw, blocks };
+      const judged: HighlightRequest = {
+        page,
+        title,
+        palette: raw.palette,
+        blocks,
+        judge: raw.judge,
+      };
 
       /* 片之间没有依赖,按 chunkConcurrency 并发跑;结果按片序合并,与串行语义一致。
          串行版本在最长的那几页(17 片)会超过 Cloudflare ~100s 的代理超时。 */

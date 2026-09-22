@@ -243,6 +243,9 @@ async function makeHarness(
     ANTHROPIC_API_KEY: 'sk-test',
     SITE_BASE: 'https://aipm.ac',
     ALLOWED_ORIGINS: 'https://aipm.ac,http://127.0.0.1:8000',
+    // 站长 = alice(假 GitHub 只发得出 alice / bob 两个身份):bob 由此成为
+    // 「登录了但不是站长」那一种,重新生成的两条拒绝路径各有一个身份可用。
+    ADMIN_LOGINS: 'alice',
     DATA_DIR: dataDir,
     SEARCH_INDEX_URL: 'https://aipm.ac/search/search_index.json',
     ...env,
@@ -300,7 +303,10 @@ async function makeHarness(
 }
 
 /** 走完整的 OAuth 往返拿到 bearer token(全程打 fake GitHub)。 */
-async function loginAs(h: Harness, code: string): Promise<{ token: string; user: Author }> {
+async function loginAs(
+  h: Harness,
+  code: string,
+): Promise<{ token: string; user: Author; admin?: boolean }> {
   const startRes = await fetch(
     `${h.base}/api/auth/github/start?return=${encodeURIComponent('https://aipm.ac/ai/rag/')}`,
     { redirect: 'manual' },
@@ -2761,6 +2767,140 @@ async function suiteHttpJudge(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// H. 重新生成(站长专用)
+// ---------------------------------------------------------------------------
+
+async function suiteHttpRegenerate(): Promise<void> {
+  section('H. 重新生成智能高亮');
+
+  await test('匿名请求 refresh → 401,不花钱', async () => {
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      const res = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS, refresh: true }),
+      });
+      eq(res.status, 401, '应 401');
+      eq(res.body.error, 'login_required', '错误码');
+      eq(h.jev.calls, 0, '被拒的请求不该走到 provider');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('登录但不是站长 → 403,不花钱', async () => {
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      const bob = await loginAs(h, 'code-bob');
+      const res = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        token: bob.token,
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS, refresh: true }),
+      });
+      eq(res.status, 403, '应 403');
+      eq(res.body.error, 'forbidden', '错误码');
+      eq(h.jev.calls, 0, '被拒的请求不该走到 provider');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('站长 refresh:跳过缓存重新判分,并把新结果覆盖回缓存', async () => {
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      const alice = await loginAs(h, 'code-alice');
+      const payload = { page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS };
+      const first = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      eq(first.status, 200, '第一次');
+      eq(first.body.cached, undefined, '第一次是真判');
+      eq(h.jev.calls, 1, 'provider 被调用一次');
+
+      // 换一份 handler:重新生成必须真的再问一次,而不是把上一份原样摆回来
+      h.jev.handler = async () => ({ suggestions: [suggestion('b2', { color: 'green' })] });
+      const again = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({ ...payload, refresh: true }),
+      });
+      eq(again.status, 200, '应 200');
+      eq(again.body.cached, undefined, '重新生成的结果不算命中缓存');
+      eq(h.jev.calls, 2, 'provider 被再问一次');
+      eq(
+        again.body.suggestions.map((s: Suggestion) => s.color),
+        ['green'],
+        '拿到的是新一轮的判定',
+      );
+
+      // 覆盖:下一位访客不再花钱,拿到的是新结果
+      const after = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      eq(after.body.cached, true, '命中缓存');
+      eq(
+        after.body.suggestions.map((s: Suggestion) => s.color),
+        ['green'],
+        '缓存已被新结果覆盖',
+      );
+      eq(h.jev.calls, 2, '普通访客不额外花钱');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('重新生成失败时,手上那份旧缓存原样保留', async () => {
+    /* 一次失败的重新生成没有理由把已有结果抹掉 —— 抹掉之后下一位访客要为同一个
+       失败再付一次钱。 */
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk', HIGHLIGHT_JUDGE_FALLBACK: 'none' });
+    try {
+      const alice = await loginAs(h, 'code-alice');
+      const payload = { page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS };
+      const first = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      eq(first.status, 200, '先有一份可用结果');
+
+      h.jev.handler = async () => {
+        throw new JudgeError('rate_limited', 'jev 429', 12);
+      };
+      const failed = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify({ ...payload, refresh: true }),
+      });
+      eq(failed.status, 503, '重新生成失败');
+
+      const after = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      eq(after.status, 200, '旧缓存仍在');
+      eq(after.body.cached, true, '命中的是失败之前那一份');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('签发会话与 /api/auth/me 都带站长标记', async () => {
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      const alice = await loginAs(h, 'code-alice');
+      const bob = await loginAs(h, 'code-bob');
+      eq(alice.admin, true, '换 code 时就回带站长标记');
+      eq(bob.admin, false, '普通用户');
+      const me = await api(h, '/api/auth/me', { token: alice.token });
+      eq(me.body.admin, true, 'me 也带');
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 
@@ -2775,6 +2915,7 @@ async function main(): Promise<void> {
   await suiteGuardrails();
   await suiteHttpAuth();
   await suiteHttpJudge();
+  await suiteHttpRegenerate();
 
   console.log(`\n${'─'.repeat(60)}`);
   if (failures.length === 0) {
