@@ -162,6 +162,16 @@ export function isModerator(actor: Author, moderatorLogins: string[]): boolean {
 }
 
 /**
+ * 站长:ADMIN_LOGINS 白名单里的 login,比版主多一项「重新生成智能高亮」的能力
+ * ——跳过同页缓存重新判分,并覆盖那份缓存。这一项会重复花钱(每点一次就是一轮
+ * provider 调用),所以只给站长;版主那条治理路径仍然只管删除公开批注。
+ */
+export function isAdmin(actor: Author, adminLogins: string[]): boolean {
+  if (adminLogins.length === 0) return false;
+  return adminLogins.includes(actor.login.toLowerCase());
+}
+
+/**
  * 可见性:public 任何人可读;private 只有作者本人可读。
  * 不可读一律由调用方回 **404**(不是 403)—— 对私有批注不泄露存在性。
  */

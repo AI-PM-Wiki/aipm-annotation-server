@@ -19,6 +19,7 @@
  *   DELETE /api/annotations/:id               需登录 + 仅作者(版主可删公开)
  *   GET    /api/annotations/export?page=      hypothes.is JSON 兼容导出
  *   POST   /api/highlight/suggest             不要求登录,靠限流与防滥用兜底
+ *                                             (带 refresh 时改为:需登录 + 站长)
  *
  * 鉴权走 `Authorization: Bearer <token>`,**不用 Cookie**(站点与后端跨源,
  * 第三方 Cookie 会被浏览器拦)。日志不含原始 IP 与明文 token。
@@ -44,6 +45,7 @@ import {
   canEdit,
   canRead,
   filterForScope,
+  isAdmin,
   mergeReplies,
   newAnnotationId,
   normalizeBody,
@@ -108,6 +110,8 @@ const SuggestSchema = z.object({
   palette: z.array(z.unknown()).default([]),
   blocks: z.array(z.unknown()).default([]),
   judge: z.enum(['auto', 'jev', 'llm']).default('auto'),
+  // 重新生成:跳过同页缓存重新判分。只有站长能开(见 handleSuggest)。
+  refresh: z.boolean().default(false),
 });
 
 interface ServerDeps {
@@ -682,12 +686,26 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, 'bad_request', '请求体格式不正确', cors);
       return;
     }
+    /* 重新生成是唯一一条会重复花同一页钱的通路,所以它单独设闸:普通判分匿名可用,
+       重新生成要登录且必须是站长。检查放在这里而不是 HighlightService 里 —— 身份
+       只有这一层知道。 */
+    if (parsed.data.refresh) {
+      if (actor === null) {
+        sendError(req, res, 401, 'login_required', '重新生成智能高亮需要登录', cors);
+        return;
+      }
+      if (!isAdmin(actor, config.adminLogins)) {
+        sendError(req, res, 403, 'forbidden', '只有站长可以重新生成智能高亮', cors);
+        return;
+      }
+    }
     const request: HighlightRequest = {
       page: parsed.data.page,
       title: parsed.data.title,
       palette: normalizePalette(parsed.data.palette),
       blocks: normalizeJudgeBlocks(parsed.data.blocks),
       judge: parsed.data.judge,
+      refresh: parsed.data.refresh,
     };
     const ipKey = hashIp(clientIp(req));
     const controller = new AbortController();
@@ -831,7 +849,19 @@ export function createApp(deps: ServerDeps) {
             sendError(req, res, 400, 'invalid_code', 'code 无效或已过期', cors);
             return;
           }
-          writeJson(res, 200, { token: redeemed.token, user: redeemed.user }, cors);
+          // admin 一并回给前端:它决定面板页头那支笔能不能当「重新生成」用(见
+          // syncHeadIcon)。真正的闸在 handleSuggest,这里只负责让界面别摆出一颗
+          // 点下去必然 403 的按钮。
+          writeJson(
+            res,
+            200,
+            {
+              token: redeemed.token,
+              user: redeemed.user,
+              admin: isAdmin(redeemed.user, config.adminLogins),
+            },
+            cors,
+          );
         })
         .catch(fail);
       return;
@@ -847,7 +877,11 @@ export function createApp(deps: ServerDeps) {
       // App + 隧道,本地跑不起来)。只反射 ALLOWED_ORIGINS 里的 origin —— 别的站点
       // 依旧拿不到响应,而能直连回环的人本来就能用 curl 拿到同一个会话。
       const session = auth.devLogin();
-      void store.flush().then(() => writeJson(res, 200, session, cors));
+      void store
+        .flush()
+        .then(() =>
+          writeJson(res, 200, { ...session, admin: isAdmin(session.user, config.adminLogins) }, cors),
+        );
       return;
     }
 
@@ -858,7 +892,7 @@ export function createApp(deps: ServerDeps) {
         sendError(req, res, 401, 'login_required', '未登录', cors);
         return;
       }
-      writeJson(res, 200, { user: actor }, cors);
+      writeJson(res, 200, { user: actor, admin: isAdmin(actor, config.adminLogins) }, cors);
       return;
     }
 

@@ -114,6 +114,8 @@ export interface Config {
   /** OAuth state 有效期。 */
   oauthStateTtlMs: number;
   moderatorLogins: string[];
+  /** 站长白名单:比版主多一项「重新生成智能高亮」的能力(绕过同页缓存重新判分)。 */
+  adminLogins: string[];
 
   devAuthBypass: boolean;
   devAuthLogin: string;
@@ -174,6 +176,8 @@ const EnvSchema = z.object({
   AUTH_CODE_TTL_MS: z.coerce.number().int().min(1_000).max(600_000).default(60_000),
   OAUTH_STATE_TTL_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(600_000),
   MODERATOR_LOGINS: z.string().default(''),
+  // 站长登录名(逗号分隔):「重新生成智能高亮」是唯一会重复花钱的入口,只给站长。
+  ADMIN_LOGINS: z.string().default('huangyincan'),
 
   // 仅回环地址生效:非回环(如 HOST=0.0.0.0)时强制关闭,生产配错也不会开后门。
   DEV_AUTH_BYPASS: z.string().default('false'),
@@ -354,6 +358,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     authCodeTtlMs: e.AUTH_CODE_TTL_MS,
     oauthStateTtlMs: e.OAUTH_STATE_TTL_MS,
     moderatorLogins: splitList(e.MODERATOR_LOGINS).map((s) => s.toLowerCase()),
+    adminLogins: splitList(e.ADMIN_LOGINS).map((s) => s.toLowerCase()),
 
     devAuthBypass,
     devAuthLogin: e.DEV_AUTH_LOGIN,
