@@ -30,6 +30,17 @@ export interface JevProviderOptions {
   baseUrl: string;
   model: string;
   timeoutMs: number;
+  /**
+   * 输入计价(USD / 百万 token),用于把这次调用换算成**实际**消耗。
+   *
+   * 少了这一项,`usage.costUsd` 就永远是 0:编排器结算时按它记账,预占则按
+   * estimateCost 另算 —— 于是每片的预占结完就释放、`spent` 一分不涨,
+   * 日预算护栏形同虚设(只剩调用次数上限兜底)。2026-09 线上实测:一次真实
+   * Jev 调用 1941 输入 token,healthz 的 spentUsd 仍是 0。
+   *
+   * Jev 只对输入计费,输出免费,所以这里不算输出。
+   */
+  inputCostPerMtok: number;
   fetchImpl?: typeof fetch;
 }
 
@@ -283,6 +294,8 @@ export class JevJudge implements HighlightJudge {
       const summarized: JudgeUsage = {};
       if (inputTokens !== null) summarized.inputTokens = inputTokens;
       if (outputTokens !== null) summarized.outputTokens = outputTokens;
+      // 换算成实际消耗:输出免费,只算输入(见 inputCostPerMtok 的注释)
+      summarized.costUsd = ((inputTokens ?? 0) * this.opts.inputCostPerMtok) / 1_000_000;
       outcome.usage = summarized;
     }
     return outcome;

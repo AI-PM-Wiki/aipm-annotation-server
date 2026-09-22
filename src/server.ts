@@ -984,6 +984,7 @@ async function main(): Promise<void> {
         baseUrl: config.highlight.jevBaseUrl,
         model: config.highlight.jevModel,
         timeoutMs: config.highlight.jevTimeoutMs,
+        inputCostPerMtok: config.highlight.jevInputCostPerMtok,
       }),
       llm: new LlmJudge({
         apiKey: config.highlight.llmApiKey,

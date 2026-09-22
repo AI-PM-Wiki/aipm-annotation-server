@@ -964,6 +964,7 @@ async function suiteJev(): Promise<void> {
       baseUrl: 'https://api.example',
       model: 'jev-latest',
       timeoutMs: 5_000,
+      inputCostPerMtok: 0.042,
       fetchImpl: (async (input: unknown, init: { body?: string }) => {
         sent = JSON.parse(String(init.body));
         return jsonResponse({
@@ -990,6 +991,36 @@ async function suiteJev(): Promise<void> {
     eq(outcome.suggestions.length, 1, '解析出一条');
     eq(outcome.model, 'jev-1.13.0', '回带真实模型 id');
     eq(outcome.usage!.inputTokens, 120, '回带用量');
+    // 120 token × $0.042/Mtok
+    eq(outcome.usage!.costUsd, 120 * 0.042 / 1_000_000, '回带换算后的实际消耗');
+  });
+
+  await test('JevJudge 只对输入计费:输出 token 不参与换算', async () => {
+    const judge = new JevJudge({
+      apiKey: 'k',
+      baseUrl: 'https://api.example',
+      model: 'jev-latest',
+      timeoutMs: 5_000,
+      inputCostPerMtok: 0.042,
+      fetchImpl: (async () =>
+        jsonResponse({
+          model: 'jev-1.13.0',
+          answers: {
+            [questionKey('b1', 'worth')]: { noul: 0.9 },
+            [questionKey('b1', 'purpose')]: { choice: 'yellow' },
+            [questionKey('b1', 'importance')]: { score: 3 },
+          },
+          usage: { input_tokens: 1_000_000, output_tokens: 500_000 },
+        })) as unknown as typeof fetch,
+    });
+    const outcome = await judge.judge({
+      page: PAGE,
+      title: 't',
+      palette: PALETTE,
+      chunk: { index: 0, blocks: [{ id: 'b1', text: 'x' }] },
+      totalChunks: 1,
+    });
+    eq(outcome.usage!.costUsd, 0.042, '1M 输入 = $0.042,输出免费');
   });
 
   await test('JevJudge 把 429 转成可回退的 rate_limited', async () => {
@@ -998,6 +1029,7 @@ async function suiteJev(): Promise<void> {
       baseUrl: 'https://api.example',
       model: 'jev-latest',
       timeoutMs: 5_000,
+      inputCostPerMtok: 0.042,
       fetchImpl: (async () =>
         new Response('{}', { status: 429, headers: { 'retry-after': '12' } })) as unknown as typeof fetch,
     });
@@ -1024,6 +1056,7 @@ async function suiteJev(): Promise<void> {
       baseUrl: 'https://api.example',
       model: 'jev-latest',
       timeoutMs: 1_000,
+      inputCostPerMtok: 0.042,
       fetchImpl: ((_input: unknown, init: { signal?: AbortSignal }) =>
         new Promise((_resolve, reject) => {
           init.signal?.addEventListener('abort', () => {
@@ -1056,6 +1089,7 @@ async function suiteJev(): Promise<void> {
       baseUrl: 'https://api.example',
       model: 'jev-latest',
       timeoutMs: 1_000,
+      inputCostPerMtok: 0.042,
     });
     eq(judge.available, false, '无 key 不可用');
   });
@@ -2397,6 +2431,42 @@ async function suiteHttpJudge(): Promise<void> {
       eq(two.status, 429, '第二次超频');
       eq(two.body.error, 'rate_limited', '错误码');
       ok(Number(two.headers.get('retry-after')) >= 1, '带 Retry-After');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('预算按实际消耗累计:几片下来真的会耗尽(不是只靠单次预估)', async () => {
+    // 补的是**累计**那条路:下面那条「预算耗尽」用例是用「单次预估就超限」构造的
+    // ($1000000/Mtok),预占一进门就被拦下,settle→spent 的累加从没被走到过。
+    // 这里用真实量级的预估价($0.042/Mtok),靠实际消耗把预算吃满。
+    // (provider 会不会如实回 costUsd 由上面两条 JevJudge 用例把关 —— 这两层都要有:
+    //  假 judge 直接给 costUsd,拿它测 provider 的 bug 是测不出来的。)
+    const h = await makeHarness({
+      TYPESAFE_API_KEY: 'tk',
+      HIGHLIGHT_DAILY_BUDGET_USD: '0.001',
+      HIGHLIGHT_CACHE_TTL_MS: '0',
+      JEV_INPUT_COST_PER_MTOK: '0.042',
+    });
+    try {
+      h.jev.handler = async () => ({
+        suggestions: [suggestion('b1')],
+        usage: { inputTokens: 1_000, costUsd: 0.0006 },
+      });
+      const call = () =>
+        api(h, '/api/highlight/suggest', {
+          method: 'POST',
+          body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: [VALID_BLOCKS[0]!] }),
+        });
+      const one = await call();
+      eq(one.status, 200, '第一次放行');
+      const two = await call();
+      eq(two.status, 200, '第二次放行(累计 $0.0012 还没到点)');
+      const three = await call();
+      eq(three.status, 429, '累计吃满后拦下');
+      eq(three.body.error, 'budget_exhausted', '错误码');
+      eq(h.jev.calls, 2, '被拦的那次不再调 provider');
+      ok(h.highlight.budget.spentUsd > 0, '实际消耗真的记进预算了');
     } finally {
       await h.close();
     }
