@@ -10,10 +10,13 @@
  *    短路,不花 token。
  *  - **回退是可解释的**:响应里 `judge` 说明本次实际生效的 provider,`fallbackFrom`
  *    标明发生过回退及来源,便于排查与日后 A/B。
- *  - **阈值只对有原生 confidence 的 provider 生效**:Jev 低置信 → 回退 LLM;
- *    LLM 自报置信度不可信(统一 null),阈值对它天然不适用。
+ *  - **回退只对真失败发生**(超时、限流、HTTP、形状不对、未配置),不按
+ *    provider 自报的 confidence 回退 —— 为什么,见 judgeOneChunk 里那段实测记录。
+ *  - **判断质量按 worth 把关**:worthThreshold 是唯一的组装门槛。
  *  - **结果只作建议**:本层只返回建议,不写任何批注数据;采纳与否由前端决定。
  */
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { DailyBudget, DailyCounter } from '../budget.ts';
 import type { Config } from '../config.ts';
 import {
@@ -33,7 +36,7 @@ import type {
   PaletteEntry,
   Suggestion,
 } from './judge.ts';
-import { JudgeError, chunkConfidence } from './judge.ts';
+import { JudgeError } from './judge.ts';
 import { applyRules } from './rules.ts';
 
 export const PALETTE_ID_RE = /^[a-z][a-z0-9_-]{0,23}$/;
@@ -78,6 +81,14 @@ export interface HighlightServiceDeps {
   judges: { jev: HighlightJudge; llm: HighlightJudge };
   index: PageIndexLike;
   now?: () => number;
+  /**
+   * 同页判分缓存的落盘路径(留空 = 只放内存)。
+   *
+   * 为什么落盘:这条缓存的价值是「这一页有人判过了,后面的访客别再花钱」,而
+   * 「后面的访客」很容易发生在下一次重新部署之后 —— 只放内存的话,一次发布就把
+   * 全站已判过的页面清零,重新回到「每个人各花一次」。
+   */
+  cachePath?: string;
 }
 
 /** 单片判分的完整结果;请求级累加器由调用方按片序合并。 */
@@ -157,9 +168,13 @@ export class HighlightService {
   readonly jevCalls: DailyCounter;
   readonly llmCalls: DailyCounter;
   private readonly cache = new Map<string, CacheEntry>();
+  private readonly cachePath: string | null;
+  private cacheSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private cacheWriteChain: Promise<void> = Promise.resolve();
 
   constructor(deps: HighlightServiceDeps) {
     this.config = deps.config;
+    this.cachePath = deps.cachePath ?? null;
     const h = deps.config.highlight;
     this.judges = deps.judges;
     this.index = deps.index;
@@ -185,7 +200,6 @@ export class HighlightService {
       routing: {
         primary: h.primary,
         fallback: h.fallback,
-        fallbackThreshold: h.fallbackThreshold,
         worthThreshold: h.worthThreshold,
       },
       budget: {
@@ -196,6 +210,7 @@ export class HighlightService {
             : Number(this.budget.remainingUsd.toFixed(6)),
       },
       cacheEntries: this.cache.size,
+      cachePersisted: this.cachePath !== null,
     };
   }
 
@@ -229,6 +244,111 @@ export class HighlightService {
       if (!oldest.done) this.cache.delete(oldest.value);
     }
     this.cache.set(key, { expiresAt: this.now() + h.cacheTtlMs, body: { ...body, cached: undefined } });
+    this.scheduleCacheSave();
+  }
+
+  /**
+   * 启动加载落盘的缓存。
+   *
+   * 容忍坏文件:解析不了、形状不对、过期的条目一律丢掉,绝不让一个缓存文件把
+   * 服务挡在启动之外(它只是省钱用的,不是数据)。多出来的条目按过期时间保留
+   * 最新的 maxEntries 条 —— 与运行期的淘汰策略一致。
+   */
+  async loadCache(): Promise<{ loaded: number; dropped: number }> {
+    if (this.cachePath === null) return { loaded: 0, dropped: 0 };
+    const h = this.config.highlight;
+    if (h.cacheTtlMs <= 0 || h.cacheMaxEntries <= 0) return { loaded: 0, dropped: 0 };
+    let raw: string;
+    try {
+      raw = await readFile(this.cachePath, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { loaded: 0, dropped: 0 };
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          event: 'highlight_cache_load_failed',
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      return { loaded: 0, dropped: 0 };
+    }
+    let dropped = 0;
+    let entries: Array<{ key: string; expiresAt: number; body: SuggestBody }> = [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const list = isRecord(parsed) && Array.isArray(parsed.entries) ? parsed.entries : [];
+      for (const item of list) {
+        if (!isRecord(item) || typeof item.key !== 'string' || typeof item.expiresAt !== 'number') {
+          dropped++;
+          continue;
+        }
+        if (!isRecord(item.body) || !Array.isArray(item.body.suggestions)) {
+          dropped++;
+          continue;
+        }
+        if (item.expiresAt <= this.now()) {
+          dropped++;
+          continue;
+        }
+        entries.push({
+          key: item.key,
+          expiresAt: item.expiresAt,
+          body: {
+            ...(item.body as unknown as SuggestBody),
+            degraded: Array.isArray(item.body.degraded) ? (item.body.degraded as DegradedBlock[]) : [],
+            cached: undefined,
+          },
+        });
+      }
+    } catch {
+      return { loaded: 0, dropped: 0 };
+    }
+    entries.sort((a, b) => a.expiresAt - b.expiresAt);
+    if (entries.length > h.cacheMaxEntries) entries = entries.slice(entries.length - h.cacheMaxEntries);
+    for (const e of entries) this.cache.set(e.key, { expiresAt: e.expiresAt, body: e.body });
+    return { loaded: entries.length, dropped };
+  }
+
+  /** 落盘是攒着的:判分本身已经是几秒级的操作,不必每条都同步写一次盘。 */
+  private scheduleCacheSave(): void {
+    if (this.cachePath === null || this.cacheSaveTimer !== null) return;
+    this.cacheSaveTimer = setTimeout(() => {
+      this.cacheSaveTimer = null;
+      void this.flushCache();
+    }, 2_000);
+    // 只有这一件事要等的话,别拖着进程不让它退出
+    this.cacheSaveTimer.unref?.();
+  }
+
+  /** 把当前缓存整体写到磁盘(原子替换:先写 .tmp 再 rename)。 */
+  async flushCache(): Promise<void> {
+    if (this.cachePath === null) return;
+    if (this.cacheSaveTimer !== null) {
+      clearTimeout(this.cacheSaveTimer);
+      this.cacheSaveTimer = null;
+    }
+    const entries = [...this.cache.entries()].map(([key, entry]) => ({
+      key,
+      expiresAt: entry.expiresAt,
+      body: entry.body,
+    }));
+    const payload = JSON.stringify({ version: 1, entries });
+    this.cacheWriteChain = this.cacheWriteChain.then(async () => {
+      try {
+        await mkdir(dirname(this.cachePath!), { recursive: true });
+        await writeFile(`${this.cachePath}.tmp`, payload, 'utf8');
+        await rename(`${this.cachePath}.tmp`, this.cachePath!);
+      } catch (err) {
+        console.error(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: 'highlight_cache_write_failed',
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      }
+    });
+    await this.cacheWriteChain;
   }
 
   /**
@@ -351,7 +471,6 @@ export class HighlightService {
   ): Promise<ChunkOutcome> {
     const h = this.config.highlight;
     const first = available[0]!;
-    const second = available[1];
     const degraded: DegradedBlock[] = [];
     let costUsd = 0;
     let usedFallbackFrom: 'jev' | 'llm' | null = null;
@@ -375,8 +494,6 @@ export class HighlightService {
     let chunkSuggestions: Suggestion[] | null = null;
     let chunkUsage: JudgeUsage | undefined;
     let chunkModel: string | undefined;
-    /** 主选回了低置信但有效的结果:兜底也失败时用它,别把已有的答案丢掉。 */
-    let pendingLowConfidence: { suggestions: Suggestion[]; model?: string } | null = null;
     let failureReason = 'unknown';
 
     for (let i = 0; i < available.length; i++) {
@@ -421,20 +538,16 @@ export class HighlightService {
           isFallback ? 'fallback' : 'ok',
         );
 
-        const confidence = chunkConfidence(outcome.suggestions);
-        if (
-          !isFallback &&
-          second !== undefined &&
-          confidence !== null &&
-          confidence < h.fallbackThreshold
-        ) {
-          // Jev 回得低置信:先留底,再试兜底(阈值只对有原生置信度的 provider 生效)
-          pendingLowConfidence = { suggestions: outcome.suggestions };
-          if (outcome.model !== undefined) pendingLowConfidence.model = outcome.model;
-          failureReason = `low_confidence(${confidence.toFixed(2)})`;
-          this.logCall(name, chunk, outcome.usage, 0, page, 'low_confidence');
-          continue;
-        }
+        /* 这里**不再**拿 provider 自报的 confidence 决定要不要回退。
+           原写法是「本片建议的平均 confidence < fallbackThreshold 就丢下它、改问兜底」,
+           线上实测这条门几乎把 Jev 全判成不合格:Jev 的 confidence 取的是「颜色选择」
+           与「重要度档位」两个答案里较小的那个,而重要度是 4 档量表、颜色是 5 选 1,
+           原生置信度本就常落在 0.3–0.7(实测首页 32 块均值 0.44、术语表 40 块均值
+           0.66,正好横跨 0.6 这条线)。于是同一页时而用 Jev、时而整片回退到兜底
+           模型(贵约 12 倍、慢 10–30 倍),而「这段值不值得高亮」这个真正的判断
+           (worth,noul 概率)压根没参与这次决策。
+           现在回退只对**真失败**发生(超时、限流、HTTP、形状不对、未配置);
+           判断质量由 worthThreshold 把关。 */
         chunkSuggestions = outcome.suggestions;
         effective = name;
         if (isFallback) usedFallbackFrom = first;
@@ -454,12 +567,6 @@ export class HighlightService {
     if (reserved > 0) {
       this.budget.release(reserved);
       reserved = 0;
-    }
-    if (chunkSuggestions === null && pendingLowConfidence !== null) {
-      // 兜底没成功,但主选当时是有有效答案的(只是置信度低)——保留它
-      chunkSuggestions = pendingLowConfidence.suggestions;
-      if (pendingLowConfidence.model !== undefined) chunkModel = pendingLowConfidence.model;
-      effective = first;
     }
     if (chunkSuggestions === null) {
       for (const b of chunk.blocks) degraded.push({ id: b.id, reason: failureReason });
@@ -610,13 +717,14 @@ export class HighlightService {
         if (outcome.suggestions === null) continue; // 片内已把失败原因写进 degraded
         succeeded++;
         for (const s of outcome.suggestions) {
-          if (
-            s.worth >= h.worthThreshold &&
-            (s.confidence === null || s.confidence >= h.fallbackThreshold)
-          ) {
+          /* 只按 worth 把关:它是 provider 对「值不值得高亮」这个问题的作答
+             (Jev 的 noul 概率、LLM 的 0..1 自评)。confidence 不进这道门 ——
+             它衡量的是颜色/重要度答得笃不笃定,拿它否决整条建议会让
+             「颜色没选准」变成「这段不给建议」(见 judgeOneChunk 里的实测)。 */
+          if (s.worth >= h.worthThreshold) {
             suggestions.push(s);
           } else {
-            degraded.push({ id: s.id, reason: 'below_threshold' });
+            degraded.push({ id: s.id, reason: 'not_worth' });
           }
         }
         for (const b of chunk.blocks) {

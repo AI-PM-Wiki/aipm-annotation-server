@@ -21,9 +21,10 @@ export type LlmWireMode = 'structured' | 'json';
 export interface HighlightConfig {
   primary: JudgePrimary;
   fallback: JudgeFallback;
-  /** 仅对带原生 confidence 的 provider(jev)生效;llm 自报置信度不可信,统一置 null。 */
-  fallbackThreshold: number;
-  /** 组装的建议门槛:worth 与(有值时的)confidence 都要 ≥ 该值。 */
+  /**
+   * 组装的建议门槛,也是判分质量**唯一**的门槛:provider 给这段文字打的
+   * worth 低于它就不下发建议。回退不再看 provider 自报的 confidence。
+   */
   worthThreshold: number;
 
   jevApiKey: string;
@@ -184,7 +185,6 @@ const EnvSchema = z.object({
 
   HIGHLIGHT_JUDGE_PRIMARY: z.enum(['jev', 'llm']).default('jev'),
   HIGHLIGHT_JUDGE_FALLBACK: z.enum(['jev', 'llm', 'none']).default('llm'),
-  HIGHLIGHT_JUDGE_FALLBACK_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6),
   HIGHLIGHT_WORTH_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
 
   TYPESAFE_API_KEY: z.string().default(''),
@@ -235,8 +235,12 @@ const EnvSchema = z.object({
   // 那会让日预算护栏对 Jev 完全失效 —— 只剩调用次数上限在兜底。
   JEV_INPUT_COST_PER_MTOK: z.coerce.number().min(0).default(0.042),
 
-  HIGHLIGHT_CACHE_TTL_MS: z.coerce.number().int().min(0).default(900_000),
-  HIGHLIGHT_CACHE_MAX_ENTRIES: z.coerce.number().int().min(0).max(10_000).default(200),
+  // 同页判分结果缓存。key 里有页面内容 hash,所以「内容没变就复用」是安全的:
+  // TTL 只用来限制**答案**的陈旧度(判分模型/口径会变),不需要短到分钟级。
+  // 默认 7 天 + 落盘(DATA_DIR/highlight-cache.json):一次判分的结果能被这一周里
+  // 所有访客复用,重启/重新部署也不丢 —— 匿名端点上的重复请求本就不该重复花钱。
+  HIGHLIGHT_CACHE_TTL_MS: z.coerce.number().int().min(0).default(7 * 24 * 3600 * 1000),
+  HIGHLIGHT_CACHE_MAX_ENTRIES: z.coerce.number().int().min(0).max(10_000).default(800),
 });
 
 function parseBool(value: string): boolean {
@@ -361,7 +365,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     highlight: {
       primary: e.HIGHLIGHT_JUDGE_PRIMARY,
       fallback: e.HIGHLIGHT_JUDGE_FALLBACK,
-      fallbackThreshold: e.HIGHLIGHT_JUDGE_FALLBACK_THRESHOLD,
       worthThreshold: e.HIGHLIGHT_WORTH_THRESHOLD,
 
       jevApiKey: e.TYPESAFE_API_KEY,

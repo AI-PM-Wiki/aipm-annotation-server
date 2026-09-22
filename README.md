@@ -140,14 +140,22 @@ POST /api/highlight/suggest
 |---|---|---|
 | 形态 | 类型化决策 API:`noul` / `choice` / `score` | 提示词进、结构化输出出 |
 | 批量 | 一次请求并行问 N 个独立问题,各回各的 key | 一次生成一段输出,自己组织结构 |
-| 置信度 | 原生 calibrated confidence | 无(自报不可信 → 统一置 `null`) |
-| 阈值策略 | 低置信 → 回退 LLM | 不适用 |
+| 置信度 | 原生 calibrated confidence(仅作诊断元数据)| 无(自报不可信 → 统一置 `null`) |
+| 门槛 | `worth` 概率 ≥ `HIGHLIGHT_WORTH_THRESHOLD` | 同左(自评 0..1) |
 | 失败模式 | 429、early access 可能拿不到 key | 超时、JSON 不合法、漏块 |
 
 「该不该高亮 / 用什么颜色 / 多重要」编码成批量 typed questions 再组装,与 LLM 那套是
 两套独立适配器;业务逻辑只认统一的 `Suggestion`。路由可配(`HIGHLIGHT_JUDGE_PRIMARY` /
-`_FALLBACK` / `_FALLBACK_THRESHOLD`),**实际生效的 provider 与回退来源在响应里可解释**
-(`judge` / `fallbackFrom`,前端建议条上标「Jev」/「Claude」)。
+`_FALLBACK`),**实际生效的 provider 与回退来源在响应里可解释**(`judge` / `fallbackFrom`,
+前端建议条上标出模型 id)。
+
+**回退只对真失败发生**(超时、限流、HTTP 错误、形状不对、未配置),不按 provider 自报的
+confidence 回退。这条是 2026-09-22 按实测改的:原先「本片建议的平均 confidence < 0.6 就
+整片改问兜底」,而 Jev 的 confidence 取的是「颜色选择」与「重要度档位」两个答案里较小的
+那个 —— 重要度是 4 档量表、颜色是 5 选 1,原生置信度本就常落在 0.3–0.7(首页 32 块均值
+0.44、术语表 40 块均值 0.66,正好横跨 0.6)。结果是同一页时而用 Jev、时而整体回退到
+兜底模型(贵约 12 倍、慢 10–30 倍),而「这段值不值得高亮」这个真正的判断根本没参与
+这次决策。
 
 规则先跑:过短、纯符号、代码块、导航目录、重复标题在任何 provider 之前短路,不花 token。
 
@@ -156,14 +164,14 @@ POST /api/highlight/suggest
 ```bash
 npm install
 npm run typecheck     # 类型检查
-npm run unit-check    # 单元检查(92 项;外部依赖全部注入 fake,不联网)
+npm run unit-check    # 单元检查(101 项;外部依赖全部注入 fake,不联网)
 npm run build         # 产出 dist/
 npm run dev           # tsx 直跑,读 .env
 ```
 
 `unit-check` 覆盖纯函数(分块、规则、索引抽样、回复合并、return 白名单、预算跨日)、
 两个 provider 的适配与降级、以及端到端 HTTP 语义(三态可见性、归属 401/403/404、
-限流与预算、回退与缓存、LLM 兜底的两种线上格式(结构化输出 / 抠 JSON))。当前 92 项。
+限流与预算、回退与缓存(含落盘后重启复用)、LLM 兜底的两种线上格式(结构化输出 / 抠 JSON))。当前 101 项。
 
 ## 配置
 
@@ -252,4 +260,6 @@ await fetch('http://127.0.0.1:8788/api/auth/dev', { method: 'POST' })
   真实登录走 `/api/auth/github/start` 的整页跳转,不受影响。
 - 智能高亮的同页缓存 key 是「页面 + 正文哈希 + judge + 色板版本」。页面正文没变
   时同页各客户端共享缓存;前端给块的 id 取「文档里的位置序号」而非「入选块序号」,
-  各客户端的 id↔段落映射因此一致,缓存结果不会被错配到别的段落上。
+  各客户端的 id↔段落映射因此一致,缓存结果不会被错配到别的段落上。缓存在
+  `DATA_DIR/highlight-cache.json` 落盘(TTL 默认 7 天、上限 800 条、原子写),
+  重启与重新部署都接着用 —— 一次判分的结果不该只有它自己那一轮进程受益。
