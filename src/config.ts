@@ -12,6 +12,12 @@ export type JudgeName = 'jev' | 'llm';
 export type JudgePrimary = JudgeName;
 export type JudgeFallback = JudgeName | 'none';
 
+/**
+ * LLM 兜底的线上格式(与 highlight/llm-provider.ts 的 LlmWireMode 一致)。
+ * 这里单独声明是为了让 config.ts 不依赖具体 provider 实现,保持可单测的纯函数。
+ */
+export type LlmWireMode = 'structured' | 'json';
+
 export interface HighlightConfig {
   primary: JudgePrimary;
   fallback: JudgeFallback;
@@ -29,6 +35,10 @@ export interface HighlightConfig {
   llmModel: string;
   llmMaxTokens: number;
   llmTimeoutMs: number;
+  /** 留空 = 官方端点;非空时必须是 Anthropic 兼容端点(并要求 llmMode='json')。 */
+  llmBaseUrl: string;
+  /** structured = 官方结构化输出;json = 纯文本 + 自己解析(兼容端点)。 */
+  llmMode: LlmWireMode;
 
   /** 每请求硬上限(超限 400):防端点被当免费 LLM 代理。 */
   maxBlocksPerRequest: number;
@@ -183,6 +193,14 @@ const EnvSchema = z.object({
   JEV_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(20_000),
 
   ANTHROPIC_API_KEY: z.string().default(''),
+  // 兜底判分的端点。留空 = 官方 api.anthropic.com。
+  // 指到 Anthropic 兼容端点(如 https://api.deepseek.com/anthropic)时必须走 json 模式:
+  // 2026-09 实测这类端点会**静默忽略** output_config.format、回普通文本,
+  // 结构化输出直接解析失败(报 "Failed to parse structured output")。
+  ANTHROPIC_BASE_URL: z.string().default(''),
+  // 不写就从 base URL 推断(官方 → structured,第三方 → json);
+  // 显式写 structured 又配了第三方端点会启动即报错,不留「配了却跑不通」的活口。
+  HIGHLIGHT_LLM_MODE: z.enum(['structured', 'json']).optional(),
   // LLM 兜底 judge 的模型:批量分类/抽取型判断,用便宜快速的 haiku 档;
   // 想抬质量把它换成 claude-sonnet-5 / claude-opus-5 即可(计价见下两行)。
   HIGHLIGHT_MODEL: z.string().min(1).default('claude-haiku-4-5'),
@@ -242,6 +260,20 @@ export function isLoopbackHost(host: string): boolean {
  * DEV_AUTH_BYPASS 的实际生效值:必须显式开启 **且** 绑定在回环地址上。
  * 生产把 HOST 配成 0.0.0.0 时即便 env 里写着 true 也一律关闭(配置错误不开后门)。
  */
+/**
+ * 端点是不是官方 Anthropic。留空(true)与 api.anthropic.com 都算官方 ——
+ * 只有官方端点实现了 `output_config.format` 结构化输出。
+ */
+export function isOfficialAnthropicBase(baseUrl: string): boolean {
+  if (baseUrl.length === 0) return true;
+  try {
+    const url = new URL(baseUrl);
+    return url.hostname === 'api.anthropic.com';
+  } catch {
+    return false;
+  }
+}
+
 export function resolveDevAuthBypass(host: string, raw: string): boolean {
   if (!parseBool(raw)) return false;
   return isLoopbackHost(host);
@@ -264,6 +296,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         '(本地开发可设 DEV_AUTH_BYPASS=true 且 HOST 为回环地址)',
     );
   }
+
+  const llmBaseUrl = e.ANTHROPIC_BASE_URL.trim().replace(/\/+$/, '');
+  const officialAnthropic = isOfficialAnthropicBase(llmBaseUrl);
+  if (e.HIGHLIGHT_LLM_MODE === 'structured' && !officialAnthropic) {
+    throw new Error(
+      '环境变量校验失败: ANTHROPIC_BASE_URL 指向了非官方端点,但 HIGHLIGHT_LLM_MODE=structured' +
+        ' —— 兼容端点不支持结构化输出(output_config.format 会被静默忽略),请设为 json',
+    );
+  }
+  const llmMode: LlmWireMode =
+    e.HIGHLIGHT_LLM_MODE ?? (officialAnthropic ? 'structured' : 'json');
 
   const allowedOrigins = splitList(e.ALLOWED_ORIGINS);
   const returnOrigins = splitList(e.RETURN_ORIGINS);
@@ -330,6 +373,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       llmModel: e.HIGHLIGHT_MODEL,
       llmMaxTokens: e.HIGHLIGHT_MAX_TOKENS,
       llmTimeoutMs: e.HIGHLIGHT_TIMEOUT_MS,
+      llmBaseUrl,
+      llmMode,
 
       maxBlocksPerRequest: e.HIGHLIGHT_MAX_BLOCKS,
       maxCharsPerRequest: e.HIGHLIGHT_MAX_CHARS,

@@ -503,11 +503,13 @@ export class HighlightService {
       name === 'jev' ? this.judges.jev.available : this.judges.llm.available,
     );
     if (available.length === 0) {
+      // 与下面的「暂时性失败」用不同错误码:这一种是运维没配好,重试无意义,
+      // 前端据此禁用按钮;而那一种是排队满/分片全挂,重试有意义,不该把按钮焊死。
       return {
         ok: false,
         status: 503,
-        code: 'highlight_unavailable',
-        message: '智能高亮当前不可用(未配置判分 provider 的密钥)',
+        code: 'highlight_not_configured',
+        message: '智能高亮当前不可用(服务未配置判分 provider 的密钥)',
       };
     }
 
@@ -536,7 +538,7 @@ export class HighlightService {
           status: 503,
           code: 'concurrency_limit',
           message: err.code === 'queue_full' ? '服务繁忙,请稍后再试' : '排队超时,请稍后再试',
-          retryAfterSec: err.code === 'queue_full' ? 10 : 1,
+          retryAfterSec: err.code === 'queue_full' ? 15 : 5,
         };
       }
       throw err;
@@ -606,6 +608,7 @@ export class HighlightService {
           status: 503,
           code: 'highlight_unavailable',
           message: '智能高亮服务暂时不可用,请稍后再试',
+          retryAfterSec: 30,
         };
       }
 

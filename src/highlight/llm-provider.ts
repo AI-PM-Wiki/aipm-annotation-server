@@ -76,20 +76,109 @@ export interface LlmCallResult {
  */
 export type LlmCaller = (params: LlmCallParams) => Promise<LlmCallResult>;
 
+/** 线上格式:官方端点用结构化输出;Anthropic 兼容端点用纯文本 + 自己解析。 */
+export type LlmWireMode = 'structured' | 'json';
+
 export interface AnthropicCallerOptions {
   apiKey: string;
   /** SDK 超时(毫秒;TypeScript SDK 的单位是 ms)。 */
   timeoutMs: number;
+  /** 默认 https://api.anthropic.com。指向兼容端点时必须同时把 mode 设成 'json'。 */
+  baseUrl?: string;
+  /**
+   * `structured` = `output_config.format`(2026-09 实测**只有官方端点支持**;
+   * DeepSeek 的 anthropic 兼容端点会直接忽略它、回普通文本,SDK 解析 JSON 报错);
+   * `json` = 普通 messages.create + 提示词约束 + 自己抠 JSON。
+   */
+  mode?: LlmWireMode;
 }
 
-/** 默认实现:Anthropic SDK + `output_config.format` 结构化输出。 */
+/** json 模式下追加在用户提示词末尾的输出约束。 */
+export const JSON_OUTPUT_SUFFIX = [
+  '',
+  '只输出一个 JSON 对象,不要解释、不要前后缀、不要 Markdown 代码块,形状如下:',
+  '{"results":[{"id":"片段 id","worth":0.0,"color":"色板 id","importance":0}]}',
+  '每个给定片段都必须出现一次,id 原样回填,color 必须来自色板。',
+].join('\n');
+
+/**
+ * 从模型输出里抠出 JSON 对象(纯函数,可单测)。
+ *
+ * 走兼容端点时输出是自由文本,常见三种脏法:包在 ``` 围栏里、前后带解释、
+ * 干脆没按 JSON 回答。按「去围栏 → 取第一个 { 到最后一个 } → JSON.parse」处理;
+ * 失败返回 null,上层按「形状不对」重试一次(与结构化输出解析失败走同一条路)。
+ */
+export function parseJsonOutput(text: string): unknown {
+  if (typeof text !== 'string') return null;
+  let s = text.trim();
+  const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(s);
+  if (fence !== null && typeof fence[1] === 'string') s = fence[1].trim();
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  try {
+    return JSON.parse(s.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+/** 最小客户端契约:只为让单测能注入假客户端(不联网)。 */
+export interface MessagesClientLike {
+  messages: {
+    create(
+      body: Record<string, unknown>,
+      opts?: { signal?: AbortSignal },
+    ): Promise<{
+      content?: Array<{ type: string; text?: string }>;
+      usage?: { input_tokens?: number; output_tokens?: number };
+      model?: string;
+    }>;
+  };
+}
+
+/** json 模式的调用实现:普通 messages.create + 自己解析。 */
+export function createJsonCaller(client: MessagesClientLike): LlmCaller {
+  return async (params: LlmCallParams): Promise<LlmCallResult> => {
+    const message = await client.messages.create(
+      {
+        model: params.model,
+        max_tokens: params.maxTokens,
+        system: params.system,
+        messages: [{ role: 'user', content: params.user + JSON_OUTPUT_SUFFIX }],
+      },
+      params.signal === undefined ? undefined : { signal: params.signal },
+    );
+    const text = (message.content ?? [])
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text ?? '')
+      .join('');
+    const out: LlmCallResult = { parsed: parseJsonOutput(text) };
+    if (message.usage !== undefined) {
+      out.usage = {
+        inputTokens: message.usage.input_tokens,
+        outputTokens: message.usage.output_tokens,
+      };
+    }
+    if (typeof message.model === 'string') out.model = message.model;
+    return out;
+  };
+}
+
+/** 默认实现:Anthropic SDK;mode='structured' 走 `output_config.format`,否则纯文本。 */
 export function createAnthropicCaller(opts: AnthropicCallerOptions): LlmCaller {
   const client = new Anthropic({
     apiKey: opts.apiKey,
+    ...(opts.baseUrl === undefined || opts.baseUrl.length === 0
+      ? {}
+      : { baseURL: opts.baseUrl }),
     timeout: opts.timeoutMs,
     // 只留平台侧 1 次重试;调用级重试由 provider 自己做(要把校验错误回灌)
     maxRetries: 1,
   });
+  // SDK 的 create 是带严格参数类型的重载,与上面这个「够用就好」的最小契约结构不兼容
+  // (契约的存在只是为了让单测塞假客户端)。这一次 cast 是有意为之,不是绕过类型检查。
+  if (opts.mode === 'json') return createJsonCaller(client as unknown as MessagesClientLike);
   return async (params: LlmCallParams): Promise<LlmCallResult> => {
     const message = await client.messages.parse(
       {
@@ -117,6 +206,10 @@ export interface LlmProviderOptions {
   model: string;
   maxTokens: number;
   timeoutMs: number;
+  /** 见 AnthropicCallerOptions.baseUrl。 */
+  baseUrl?: string;
+  /** 见 AnthropicCallerOptions.mode。 */
+  mode?: LlmWireMode;
   inputCostPerMtok: number;
   outputCostPerMtok: number;
   caller?: LlmCaller;
@@ -201,7 +294,12 @@ export class LlmJudge implements HighlightJudge {
     this.caller =
       opts.caller ??
       (opts.apiKey.length > 0
-        ? createAnthropicCaller({ apiKey: opts.apiKey, timeoutMs: opts.timeoutMs })
+        ? createAnthropicCaller({
+            apiKey: opts.apiKey,
+            timeoutMs: opts.timeoutMs,
+            baseUrl: opts.baseUrl,
+            mode: opts.mode,
+          })
         : null);
   }
 

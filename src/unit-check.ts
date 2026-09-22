@@ -17,7 +17,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { loadConfig, resolveDevAuthBypass } from './config.ts';
+import { isOfficialAnthropicBase, loadConfig, resolveDevAuthBypass } from './config.ts';
 import type { Config } from './config.ts';
 import { AnnotationStore } from './store.ts';
 import { parseState } from './store.ts';
@@ -49,7 +49,13 @@ import { applyRules, dedupeKey, looksLikeCode, looksLikeNavigation } from './hig
 import type { HighlightJudge, JudgeChunkRequest, JudgeOutcome, PaletteEntry, Suggestion } from './highlight/judge.ts';
 import { JudgeError, chunkConfidence } from './highlight/judge.ts';
 import { JevJudge, assembleSuggestions, buildQuestions, questionKey } from './highlight/jev-provider.ts';
-import { LlmJudge, buildUserPrompt, normalizeResults } from './highlight/llm-provider.ts';
+import {
+  LlmJudge,
+  buildUserPrompt,
+  createJsonCaller,
+  normalizeResults,
+  parseJsonOutput,
+} from './highlight/llm-provider.ts';
 import { HighlightService } from './highlight/index.ts';
 import { createApp } from './server.ts';
 
@@ -349,6 +355,34 @@ async function suiteConfig(): Promise<void> {
     // 回环 + 后门:允许无凭据启动
     const cfg = loadConfig({ HOST: '127.0.0.1', DEV_AUTH_BYPASS: 'true', DATA_DIR: './x' });
     eq(cfg.devAuthBypass, true, 'devAuthBypass 应为 true');
+  });
+
+  await test('LLM 兜底端点:官方用结构化输出,第三方自动切 json', () => {
+    eq(isOfficialAnthropicBase(''), true, '留空 = 官方');
+    eq(isOfficialAnthropicBase('https://api.anthropic.com'), true, '官方域名');
+    eq(isOfficialAnthropicBase('https://api.deepseek.com/anthropic'), false, '第三方');
+    eq(isOfficialAnthropicBase('不是 URL'), false, '解析不了按非官方处理');
+
+    // loadConfig 要求有 GitHub 凭据或 dev 后门,这里用后门(其余字段与本套件其他用例一致)。
+    const base = { TYPESAFE_API_KEY: 'tk', HOST: '127.0.0.1', DEV_AUTH_BYPASS: 'true' };
+    const third = loadConfig({ ...base, ANTHROPIC_API_KEY: 'sk-ds', ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic/' });
+    eq(third.highlight.llmBaseUrl, 'https://api.deepseek.com/anthropic', '末尾斜杠归一掉');
+    eq(third.highlight.llmMode, 'json', '第三方端点不写 mode 也要自动走 json');
+
+    const official = loadConfig({ ...base, ANTHROPIC_API_KEY: 'sk-ant' });
+    eq(official.highlight.llmMode, 'structured', '官方端点默认结构化输出');
+
+    const explicit = loadConfig({ ...base, ANTHROPIC_API_KEY: 'sk-ds', ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', HIGHLIGHT_LLM_MODE: 'json' });
+    eq(explicit.highlight.llmMode, 'json', '显式 json 照旧');
+
+    // 配了第三方端点却坚持 structured:启动即失败,别留「配了却跑不通」的活口。
+    let threw: unknown = null;
+    try {
+      loadConfig({ ...base, ANTHROPIC_API_KEY: 'sk-ds', ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', HIGHLIGHT_LLM_MODE: 'structured' });
+    } catch (e) {
+      threw = e;
+    }
+    ok(threw instanceof Error && /HIGHLIGHT_LLM_MODE/.test(threw.message), '矛盾配置应报错');
   });
 
   await test('默认端口 8788(避开问答服务的 8787)', () => {
@@ -1056,6 +1090,118 @@ async function suiteLlm(): Promise<void> {
   await test('结构化输出缺失/形状不对时不炸', () => {
     eq(normalizeResults(null, [{ id: 'b1', text: 'x' }], PALETTE), [], 'null 输入');
     eq(normalizeResults({ results: 'nope' }, [{ id: 'b1', text: 'x' }], PALETTE), [], '形状不对');
+  });
+
+  await test('parseJsonOutput 抠 JSON:裸对象 / 围栏 / 前后带解释 / 非 JSON', () => {
+    eq(parseJsonOutput('{"results":[]}'), { results: [] }, '裸对象');
+    eq(parseJsonOutput('```json\n{"a":1}\n```'), { a: 1 }, 'json 围栏');
+    eq(parseJsonOutput('```\n{"a":1}\n```'), { a: 1 }, '无语言标记的围栏');
+    eq(parseJsonOutput('好的,结果如下:\n{"a":1}\n希望有帮助'), { a: 1 }, '前后带解释');
+    eq(parseJsonOutput('这里没有对象'), null, '没有 JSON');
+    eq(parseJsonOutput('{坏掉的'), null, 'JSON 不合法');
+    eq(parseJsonOutput(''), null, '空串');
+  });
+
+  await test('createJsonCaller:走普通 create + 追问约束,并归一 usage', async () => {
+    // 兼容端点(DeepSeek 等)不支持 output_config.format,只能这么走。
+    let seen: Record<string, unknown> | null = null;
+    const caller = createJsonCaller({
+      messages: {
+        create: async (body) => {
+          seen = body;
+          return {
+            content: [
+              { type: 'thinking', text: '忽略我' },
+              { type: 'text', text: '```json\n{"results":[{"id":"b1"}]}\n```' },
+            ],
+            usage: { input_tokens: 7, output_tokens: 3 },
+            model: 'deepseek-v4-flash',
+          };
+        },
+      },
+    });
+    const out = await caller({ model: 'm', maxTokens: 10, system: 's', user: 'u' });
+    eq(out.parsed, { results: [{ id: 'b1' }] }, '抠出 JSON(只拼 text 块)');
+    eq(out.usage, { inputTokens: 7, outputTokens: 3 }, 'usage 归一成 camelCase');
+    eq(out.model, 'deepseek-v4-flash', '带回模型 id');
+    eq(
+      Array.isArray((seen as { tools?: unknown } | null)?.tools),
+      false,
+      '不带 tools',
+    );
+    // 闭包赋值 TS 追不到,这里读回来只能显式转一次。
+    const body = seen as unknown as { output_config?: unknown; messages: Array<{ content: string }> };
+    eq(body.output_config, undefined, '不发结构化输出字段(兼容端点会忽略)');
+    ok(body.messages[0]!.content.includes('只输出一个 JSON 对象'), '追加了输出约束');
+  });
+
+  await test('json 模式端到端:围栏输出也能归一成建议', async () => {
+    const judge = new LlmJudge({
+      apiKey: 'sk',
+      model: 'deepseek-v4-flash',
+      maxTokens: 1000,
+      timeoutMs: 5_000,
+      inputCostPerMtok: 1,
+      outputCostPerMtok: 5,
+      caller: createJsonCaller({
+        messages: {
+          create: async () => ({
+            content: [
+              {
+                type: 'text',
+                text: '```json\n{"results":[{"id":"b1","worth":0.9,"color":"key","importance":2}]}\n```',
+              },
+            ],
+            usage: { input_tokens: 100, output_tokens: 20 },
+            model: 'deepseek-v4-flash',
+          }),
+        },
+      }),
+    });
+    const outcome = await judge.judge({
+      page: PAGE,
+      title: 't',
+      palette: PALETTE,
+      chunk: { index: 0, blocks: [{ id: 'b1', text: 'x' }] },
+      totalChunks: 1,
+    });
+    eq(outcome.suggestions.length, 1, '一条建议');
+    eq(outcome.suggestions[0]!.id, 'b1', 'id 对得上');
+    eq(outcome.suggestions[0]!.source, 'llm', '来源');
+  });
+
+  await test('兼容端点整段回自由文本 → 重试一次后抛 shape(不静默返回空)', async () => {
+    let calls = 0;
+    const judge = new LlmJudge({
+      apiKey: 'sk',
+      model: 'deepseek-v4-flash',
+      maxTokens: 1000,
+      timeoutMs: 5_000,
+      inputCostPerMtok: 1,
+      outputCostPerMtok: 5,
+      caller: createJsonCaller({
+        messages: {
+          create: async () => {
+            calls++;
+            return { content: [{ type: 'text', text: '这段文字很值得高亮。' }] };
+          },
+        },
+      }),
+    });
+    const err = await judge
+      .judge({
+        page: PAGE,
+        title: 't',
+        palette: PALETTE,
+        chunk: { index: 0, blocks: [{ id: 'b1', text: 'x' }] },
+        totalChunks: 1,
+      })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    eq(calls, 2, '重试一次');
+    ok(err instanceof JudgeError && (err as JudgeError).code === 'shape', '应抛 shape');
   });
 
   await test('重试一次后仍无有效结果 → shape 错(整片交给 degraded)', async () => {
@@ -2182,7 +2328,7 @@ async function suiteHttpJudge(): Promise<void> {
     }
   });
 
-  await test('两路都不可用 → 503 highlight_unavailable', async () => {
+  await test('两路都没配密钥 → 503 highlight_not_configured(重试无意义)', async () => {
     const h = await makeHarness({ TYPESAFE_API_KEY: '', ANTHROPIC_API_KEY: '' });
     try {
       const res = await api(h, '/api/highlight/suggest', {
@@ -2190,7 +2336,30 @@ async function suiteHttpJudge(): Promise<void> {
         body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS }),
       });
       eq(res.status, 503, '应 503');
-      eq(res.body.error, 'highlight_unavailable', '错误码');
+      // 与下面那一种分开:运维没配好,前端据此**禁用**按钮,而不是让用户反复点。
+      eq(res.body.error, 'highlight_not_configured', '错误码');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('provider 暂时性失败(全片挂)→ 503 highlight_unavailable + Retry-After', async () => {
+    // 与上一条相反的判定:这是「等一下再来」,前端必须保留按钮、按 Retry-After 冷却,
+    // 不能像未配置那样把按钮焊死。回归自上线前评审的第 2 条。
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk', HIGHLIGHT_JUDGE_FALLBACK: 'none' });
+    try {
+      h.jev.handler = async () => {
+        throw new JudgeError('rate_limited', 'jev 429', 12);
+      };
+      const res = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS }),
+      });
+      eq(res.status, 503, '应 503');
+      eq(res.body.error, 'highlight_unavailable', '错误码必须是可重试的那一种');
+      // 冷却秒数只走 Retry-After 响应头(body 保持 {error,message,requestId} 不变),
+      // 跨源能读到它靠的是 Access-Control-Expose-Headers。
+      ok(Number(res.headers.get('retry-after')) >= 1, '带 Retry-After 头');
     } finally {
       await h.close();
     }

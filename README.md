@@ -156,14 +156,14 @@ POST /api/highlight/suggest
 ```bash
 npm install
 npm run typecheck     # 类型检查
-npm run unit-check    # 单元检查(66 项;外部依赖全部注入 fake,不联网)
+npm run unit-check    # 单元检查(92 项;外部依赖全部注入 fake,不联网)
 npm run build         # 产出 dist/
 npm run dev           # tsx 直跑,读 .env
 ```
 
 `unit-check` 覆盖纯函数(分块、规则、索引抽样、回复合并、return 白名单、预算跨日)、
 两个 provider 的适配与降级、以及端到端 HTTP 语义(三态可见性、归属 401/403/404、
-限流与预算、回退与缓存)。当前 67 项。
+限流与预算、回退与缓存、LLM 兜底的两种线上格式(结构化输出 / 抠 JSON))。当前 92 项。
 
 ## 配置
 
@@ -172,11 +172,22 @@ npm run dev           # tsx 直跑,读 .env
 - `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`:必填(本地开发可用 `DEV_AUTH_BYPASS`)。
   OAuth App 的回调地址必须与 `OAUTH_CALLBACK_URL` 完全一致。
 - `TYPESAFE_API_KEY`(主判分)/ `ANTHROPIC_API_KEY`(兜底判分):都可选。
-  **两个都没有时智能高亮返回 503 `highlight_unavailable`,批注主功能不受影响。**
-  LLM 兜底要**真正的 Anthropic key**(`sk-ant-`):本服务没有 `ANTHROPIC_BASE_URL`
-  覆盖项,只会打 `api.anthropic.com`,且走 `output_config.format` 结构化输出,
-  第三方兼容端点(如 DeepSeek 的 anthropic 兼容层)用不了。没有真 key 就把
-  `HIGHLIGHT_JUDGE_FALLBACK=none` 只跑 Jev —— 主判分器本来就是 Jev。
+  **两个都没配时智能高亮返回 503 `highlight_not_configured`,批注主功能不受影响**
+  —— 这个码专门表示「运维没配好」,重试无意义,前端据此禁用按钮。
+  另一种 503 `highlight_unavailable` 表示判分片全挂了(暂时性),带 `Retry-After`,
+  前端按它冷却但保留按钮。
+- LLM 兜底的两种端点:
+  - 官方 `api.anthropic.com`(留空 `ANTHROPIC_BASE_URL`):走 `output_config.format`
+    结构化输出,`HIGHLIGHT_LLM_MODE` 默认 `structured`。
+  - Anthropic 兼容端点(如 `https://api.deepseek.com/anthropic`):这类端点会
+    **静默忽略** `output_config.format`、回普通文本,结构化输出必然解析失败。
+    本服务自动切 `json` 模式(普通 `messages.create` + 追问约束 + 自己抠 JSON +
+    zod 归一)。显式把 `HIGHLIGHT_LLM_MODE` 写成 `structured` 又配第三方端点会
+    **启动即报错**,不留「配了却跑不通」的活口。
+  - 走第三方时把 `LLM_INPUT_COST_PER_MTOK` / `LLM_OUTPUT_COST_PER_MTOK` 按它的
+    价目表改,否则日预算护栏会算错账。
+- 只跑一家 provider(`HIGHLIGHT_JUDGE_FALLBACK=none`)时,主判分器任何一次超时/
+  429 都会整页 503。没有第二家兜底就不要设 `none`。
 - `JEV_INPUT_COST_PER_MTOK`:Jev 的公开费率 `$42/Btok = $0.042/Mtok`(输出免费,
   见 <https://docs.typesafe.ai/models.md>)。它进成本日志与日预算预占;填 0 会让
   金额护栏对 Jev 完全失效,只剩调用次数上限兜底。

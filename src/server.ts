@@ -990,6 +990,8 @@ async function main(): Promise<void> {
         model: config.highlight.llmModel,
         maxTokens: config.highlight.llmMaxTokens,
         timeoutMs: config.highlight.llmTimeoutMs,
+        baseUrl: config.highlight.llmBaseUrl,
+        mode: config.highlight.llmMode,
         inputCostPerMtok: config.highlight.llmInputCostPerMtok,
         outputCostPerMtok: config.highlight.llmOutputCostPerMtok,
       }),
@@ -1001,7 +1003,9 @@ async function main(): Promise<void> {
     console.log(
       `[server] 就绪: http://${config.host}:${config.port}  ` +
         `(index=${index.getStats().pageCount} 页, judge(主)=${config.highlight.primary}, ` +
-        `回退=${config.highlight.fallback}, 日预算=$ ${config.highlight.dailyBudgetUsd}` +
+        `回退=${config.highlight.fallback}` +
+        `${config.highlight.fallback === 'llm' ? `(llm:${config.highlight.llmMode}@${config.highlight.llmBaseUrl || 'api.anthropic.com'})` : ''}` +
+        `, 日预算=$ ${config.highlight.dailyBudgetUsd}` +
         `${config.devAuthBypass ? ', DEV_AUTH_BYPASS=on' : ''})`,
     );
   });
