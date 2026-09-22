@@ -211,10 +211,13 @@ export class HighlightService {
       this.cache.delete(key);
       return null;
     }
-    // 命中但要按本次请求的块集合过滤:缓存是同页的整页结果,请求可能只要其中一部分
+    /* 命中但要按本次请求的块集合过滤:缓存是同页的整页结果,请求可能只要其中一部分。
+       degraded 同样要过滤 —— 它是「这一页哪些块没给建议」的逐块记录,掺进本次没发
+       的块,面板上的「N 段未判定」就会数到用户根本没送出去的段落。 */
     const suggestions = entry.body.suggestions.filter((s) => wanted.has(s.id));
     if (suggestions.length === 0 && entry.body.suggestions.length > 0) return null;
-    return { ...entry.body, suggestions, cached: true };
+    const degraded = entry.body.degraded.filter((d) => wanted.has(d.id));
+    return { ...entry.body, suggestions, degraded, cached: true };
   }
 
   private writeCache(key: string, body: SuggestBody): void {
@@ -228,8 +231,19 @@ export class HighlightService {
     this.cache.set(key, { expiresAt: this.now() + h.cacheTtlMs, body: { ...body, cached: undefined } });
   }
 
-  /** 请求校验:不合规一律 400,并且**在任何模型调用之前**判完。 */
-  private validate(raw: HighlightRequest): { page: string; title: string } {
+  /**
+   * 请求校验:不合规一律 400,并且**在任何模型调用之前**判完。
+   *
+   * 抽样校验按块给结论:验不过的块就地丢掉(它们不是这一页的正文 —— 主题模板文字、
+   * 客户端渲染的公式等),交给调用方写进 degraded;只有「一块都验不过」才 400。
+   * 于是能进模型的仍然只有索引里找得到的文本,而一个页脚段落不会再让整页失败。
+   */
+  private validate(raw: HighlightRequest): {
+    page: string;
+    title: string;
+    blocks: JudgeBlock[];
+    rejected: DegradedBlock[];
+  } {
     const h = this.config.highlight;
     const page = canonicalPage(raw.page);
     if (page === null) throw new BadRequest('invalid_page', 'page 必须是本站路径');
@@ -246,12 +260,19 @@ export class HighlightService {
     if (chars > h.maxCharsPerRequest) {
       throw new BadRequest('too_many_chars', `总字符数超过每请求上限 ${h.maxCharsPerRequest}`);
     }
-    // 防「拿端点当免费 LLM 代理」:正文抽样必须能在站内索引里找到
+    // 防「拿端点当免费 LLM 代理」:正文抽样必须能在站内索引里找到。
+    // 一块都验不过 = 要么这不是本站的正文,要么索引与页面已经对不上 —— 拒掉。
     const verdict = verifyBlocks(this.index.pageText(page), raw.blocks, this.config.indexSampleChars);
-    if (!verdict.ok) {
-      throw new BadRequest('blocks_not_in_page', `块 ${verdict.id} 的文本不属于该页面(${verdict.reason})`);
+    if (verdict.accepted.length === 0) {
+      const first = verdict.rejected[0]!;
+      throw new BadRequest('blocks_not_in_page', `块 ${first.id} 的文本不属于该页面(${first.reason})`);
     }
-    return { page, title: raw.title.slice(0, 300) };
+    return {
+      page,
+      title: raw.title.slice(0, 300),
+      blocks: verdict.accepted,
+      rejected: verdict.rejected,
+    };
   }
 
   /** provider 链:主选 + 回退(同名或 none 时不重复)。 */
@@ -468,10 +489,14 @@ export class HighlightService {
   ): Promise<SuggestResult> {
     let page: string;
     let title: string;
+    let blocks: JudgeBlock[];
+    let rejected: DegradedBlock[];
     try {
       const validated = this.validate(raw);
       page = validated.page;
       title = validated.title;
+      blocks = validated.blocks;
+      rejected = validated.rejected;
     } catch (err) {
       if (err instanceof BadRequest) {
         return { ok: false, status: 400, code: err.code, message: err.message };
@@ -482,13 +507,17 @@ export class HighlightService {
     const h = this.config.highlight;
     const contentHash = hashPageText(this.index.pageText(page));
     const key = this.cacheKey(page, contentHash, raw);
-    const wanted = new Set(raw.blocks.map((b) => b.id));
+    const wanted = new Set(blocks.map((b) => b.id));
     const hit = this.readCache(key, wanted);
     if (hit !== null) return { ok: true, body: hit };
 
+    /* 校验阶段丢掉的块先入 degraded:它们不是这一页的正文(页脚模板文字之类),
+       用户能在「N 段未判定」里看到,而不是被静默吞掉。 */
+    const degraded: DegradedBlock[] = rejected.map((r) => ({ id: r.id, reason: r.reason }));
+
     // 规则先跑:确定性判断不花 token
-    const ruled = applyRules(raw.blocks, title);
-    const degraded: DegradedBlock[] = ruled.skipped.map((s) => ({ id: s.id, reason: s.reason }));
+    const ruled = applyRules(blocks, title);
+    for (const s of ruled.skipped) degraded.push({ id: s.id, reason: s.reason });
     if (ruled.kept.length === 0) {
       return { ok: true, body: { judge: 'rules', suggestions: [], degraded } };
     }
@@ -554,10 +583,14 @@ export class HighlightService {
       let succeeded = 0;
       let budgetBlocked = false;
 
+      /* 交给 provider 的请求只带验过的块 —— providers 只读 chunk,但别留下一条能
+         把未校验文本漏进请求对象的路。 */
+      const judged: HighlightRequest = { ...raw, blocks };
+
       /* 片之间没有依赖,按 chunkConcurrency 并发跑;结果按片序合并,与串行语义一致。
          串行版本在最长的那几页(17 片)会超过 Cloudflare ~100s 的代理超时。 */
       const outcomes = await mapWithConcurrency(chunks, h.chunkConcurrency, (chunk) =>
-        this.judgeOneChunk(chunk, available, raw, page, title, chunks.length, signal),
+        this.judgeOneChunk(chunk, available, judged, page, title, chunks.length, signal),
       );
 
       for (let i = 0; i < outcomes.length; i++) {
