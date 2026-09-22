@@ -1,0 +1,56 @@
+# AI-PM Annotation Server 部署(美西 VPS:Docker Compose + 系统级 Cloudflare 隧道)
+#
+# 拓扑:公网 → Cloudflare 边缘(HTTPS 终止)→ 隧道 → 本机系统级 cloudflared
+#       → http://127.0.0.1:8788(compose 绑定的回环端口)。对外只绑回环端口,
+#       公网不暴露任何端口。与 aipm-agent-server(8787)并列,共用同一条隧道。
+#
+# 用法:
+#   1. cp .env.example .env,填 GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET
+#      (可选:TYPESAFE_API_KEY / ANTHROPIC_API_KEY,不填则智能高亮降级为 503)
+#   2. docker compose up -d --build
+#   3. Cloudflare Zero Trust → Networks → Tunnels:在既有隧道(如 ai-gateway,
+#      ingress 在 /etc/cloudflared/config.yml)加一条 public hostname 指向
+#      http://127.0.0.1:8788(线上域名以用户最终确认为准)
+#   4. curl https://<该 hostname>/healthz 验证
+#
+# 注意:TRUST_PROXY 必须为 true(限流取 cf-connecting-ip 真实客户端 IP,
+#   否则所有请求都来自 127.0.0.1,按 IP 的限流与判分冷却全部失效)。
+
+services:
+  annotation-server:
+    build: .
+    image: aipm-annotation-server:0.1.0
+    restart: unless-stopped
+    env_file: .env
+    # 资源上限(保守值,防单容器吃满 VPS;按负载可调)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1024M
+    ports:
+      - "127.0.0.1:8788:8788"
+    # 网络子网必须固定:容器内看到的直连来源是网桥**网关**,而 .env 的
+    # TRUSTED_PROXY_IPS 要按它来配(见 .env.example)。交给 Docker 自动分配
+    # 的话,网关地址会随机器上已有网络的占用顺序漂移。
+    networks:
+      - default
+    volumes:
+      # 批注 / 会话 / 用户快照落在这里:必须持久化,否则重启丢数据与登录态
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+
+  # cloudflared 停用:本机隧道由系统级 cloudflared(ai-gateway 隧道,
+  # /etc/cloudflared/config.yml 本地 ingress)负责,无需 token 容器。

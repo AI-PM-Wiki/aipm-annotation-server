@@ -1,7 +1,8 @@
+# node_modules 可能是目录,也可能是本地为省事链到别的仓库的符号链接(两种都忽略)
+node_modules
 node_modules/
 dist/
 .env
-.env.*
-!.env.example
 *.log
-.DS_Store
+# 批注存储(公开/私有批注 + 会话与用户快照),运行时产物,不进仓库
+data/
