@@ -40,7 +40,14 @@ export interface Suggestion {
   category: string;
   /** 重要性 0..3,用于排序与每页建议数上限。 */
   importance: number;
-  /** 原生 calibrated confidence;LLM 自报不可信,统一 null。 */
+  /**
+   * 原生 calibrated confidence;LLM 自报不可信,统一 null。
+   *
+   * **只作诊断元数据,不参与任何门槛**。它衡量的是 provider 对「选哪个颜色 / 几级
+   * 重要」这类附属问题的笃定程度,不是「这段值不值得高亮」的可靠度 —— 曾经拿它当
+   * 回退与组装的门槛,结果是颜色答得含糊的段落被整条丢掉、Jev 几乎全被判成不合格
+   * (详见 highlight/index.ts 的 judgeOneChunk)。
+   */
   confidence: number | null;
   source: JudgeSource;
 }
@@ -69,7 +76,7 @@ export interface JudgeChunkRequest {
 
 /** provider 调用失败的可解释原因(用于回退判定与日志)。 */
 export class JudgeError extends Error {
-  /** 'rate_limited' | 'timeout' | 'http' | 'shape' | 'low_confidence' | 'unavailable' */
+  /** 'rate_limited' | 'timeout' | 'http' | 'shape' | 'unavailable' */
   readonly code: string;
   readonly retryAfterSec?: number;
   /**
@@ -92,17 +99,6 @@ export interface HighlightJudge {
   /** key / 依赖缺失时为 false → 编排器直接跳过并考虑回退。 */
   readonly available: boolean;
   judge(request: JudgeChunkRequest): Promise<JudgeOutcome>;
-}
-
-/**
- * 片级置信度:只统计有原生 confidence 的建议(因此 LLM 的结果恒为 null,
- * 阈值策略对 LLM 自动不生效 —— 它自报的置信度不可信,这是刻意的)。
- */
-export function chunkConfidence(suggestions: Suggestion[]): number | null {
-  const values: number[] = [];
-  for (const s of suggestions) if (s.confidence !== null) values.push(s.confidence);
-  if (values.length === 0) return null;
-  return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
 /** 统一收敛:把任何 provider 的抛错都归成 JudgeError,便于回退判定。 */

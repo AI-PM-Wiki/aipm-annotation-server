@@ -13,7 +13,7 @@
  *  3. 端到端语义(HTTP):三态可见性(私有对他人是 404 而不是 403)、归属校验、
  *     限流与预算、回退与降级、缓存复用。
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -54,7 +54,7 @@ import { SlidingWindowLimiter, mapWithConcurrency } from './rate-limit.ts';
 import { chunkBlocks } from './highlight/blocks.ts';
 import { applyRules, dedupeKey, looksLikeCode, looksLikeNavigation } from './highlight/rules.ts';
 import type { HighlightJudge, JudgeChunkRequest, JudgeOutcome, PaletteEntry, Suggestion } from './highlight/judge.ts';
-import { JudgeError, chunkConfidence } from './highlight/judge.ts';
+import { JudgeError } from './highlight/judge.ts';
 import { JevJudge, assembleSuggestions, buildQuestions, questionKey } from './highlight/jev-provider.ts';
 import {
   LlmJudge,
@@ -228,8 +228,13 @@ const PAGE_TEXT =
   '<p>知识 库 问答 的 第一步 是 把 文档 切 成语义 完整 的 块 , 再 用 向量 检索 召回 。</p>' +
   '<p>召回 质量 决定 了 回答 质量 的 上限 , 所以 分块 策略 值得 单独 调 。</p>';
 
-async function makeHarness(env: Record<string, string> = {}): Promise<Harness> {
-  const dataDir = await mkdtemp(join(tmpdir(), 'aipm-anno-test-'));
+async function makeHarness(
+  env: Record<string, string> = {},
+  reuseDataDir?: string,
+): Promise<Harness> {
+  // 传入 reuseDataDir = 模拟「同一个 DATA_DIR 上重启一个新进程」(看落盘的缓存还在不在)
+  const ownsDataDir = reuseDataDir === undefined;
+  const dataDir = reuseDataDir ?? (await mkdtemp(join(tmpdir(), 'aipm-anno-test-')));
   const clock = { ms: Date.now() };
   const config = loadConfig({
     HOST: '127.0.0.1',
@@ -265,7 +270,13 @@ async function makeHarness(env: Record<string, string> = {}): Promise<Harness> {
     async () => ({ suggestions: [suggestion('b1', { source: 'llm', confidence: null })] }),
     config.highlight.llmApiKey.length > 0,
   );
-  const highlight = new HighlightService({ config, index, judges: { jev, llm }, now: () => clock.ms });
+  const highlight = new HighlightService({
+    config,
+    index,
+    judges: { jev, llm },
+    now: () => clock.ms,
+    cachePath: join(config.dataDir, 'highlight-cache.json'),
+  });
   const { server } = createApp({ config, store, auth, index, highlight });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as AddressInfo).port;
@@ -282,7 +293,8 @@ async function makeHarness(env: Record<string, string> = {}): Promise<Harness> {
     dataDir,
     close: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(dataDir, { recursive: true, force: true });
+      await highlight.flushCache();
+      if (ownsDataDir) await rm(dataDir, { recursive: true, force: true });
     },
   };
 }
@@ -2296,7 +2308,7 @@ async function suiteHttpJudge(): Promise<void> {
     }
   });
 
-  await test('低于阈值的不下发(worth / confidence)', async () => {
+  await test('worth 低于阈值的块不下发', async () => {
     const h = await makeHarness({ TYPESAFE_API_KEY: 'tk', HIGHLIGHT_WORTH_THRESHOLD: '0.8' });
     try {
       h.jev.handler = async () => ({
@@ -2312,7 +2324,7 @@ async function suiteHttpJudge(): Promise<void> {
       eq(res.body.suggestions.map((s: { id: string }) => s.id), ['b1'], '只留过线的');
       ok(
         res.body.degraded.some(
-          (d: { id: string; reason: string }) => d.id === 'b2' && d.reason === 'below_threshold',
+          (d: { id: string; reason: string }) => d.id === 'b2' && d.reason === 'not_worth',
         ),
         '未过线的块进 degraded',
       );
@@ -2321,26 +2333,27 @@ async function suiteHttpJudge(): Promise<void> {
     }
   });
 
-  await test('Jev 低置信 → 回退 LLM(阈值只对有原生置信度的 provider 生效)', async () => {
-    const h = await makeHarness({
-      TYPESAFE_API_KEY: 'tk',
-      ANTHROPIC_API_KEY: 'sk-test',
-      HIGHLIGHT_JUDGE_FALLBACK_THRESHOLD: '0.6',
-    });
+  await test('Jev 答得含糊(confidence 低)不再触发回退', async () => {
+    /* 这条钉住的是 2026-09-22 的线上实测结论:Jev 的 confidence 量的是「颜色选得
+       准不准 / 几级重要」,不是「这段值不值得高亮」。拿它当回退门槛会把首页这类
+       页面(32 块均值 0.44)整体推到贵 12 倍的兜底模型上,而 Jev 的答案本身没问题。
+       回退只对真失败发生(下一个用例)。 */
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk', ANTHROPIC_API_KEY: 'sk-test' });
     try {
-      h.jev.handler = async () => ({ suggestions: [suggestion('b1', { confidence: 0.2 })] });
-      h.llm.handler = async () => ({
-        suggestions: [suggestion('b1', { source: 'llm', confidence: null })],
+      h.jev.handler = async () => ({
+        suggestions: [suggestion('b1', { worth: 0.9, confidence: 0.2 })],
+        model: 'jev-1.13.0',
       });
       const res = await api(h, '/api/highlight/suggest', {
         method: 'POST',
         body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: [VALID_BLOCKS[0]!] }),
       });
       eq(res.status, 200, '应 200');
-      eq(res.body.judge, 'llm', '实际生效的是 LLM');
-      eq(res.body.fallbackFrom, 'jev', '标注回退来源');
-      eq(res.body.suggestions[0].source, 'llm', '建议条来源是 LLM');
-      eq(h.llm.calls, 1, 'LLM 被调用一次');
+      eq(res.body.judge, 'jev', '实际生效的仍是 Jev');
+      eq(res.body.fallbackFrom, undefined, '不标回退');
+      eq(h.llm.calls, 0, '兜底模型一次都没被叫');
+      eq(res.body.suggestions.length, 1, '置信度低的建议照样下发(worth 才是门槛)');
+      eq(res.body.suggestions[0].confidence, 0.2, 'confidence 作为诊断元数据保留');
     } finally {
       await h.close();
     }
@@ -2528,6 +2541,84 @@ async function suiteHttpJudge(): Promise<void> {
         0,
         '没发来的块不该出现在未判定里',
       );
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('判分缓存落盘:重启后同页仍然命中,不再调 provider', async () => {
+    /* 「这一页有人判过了,后面的访客别再花钱」不该被一次重新部署清空 —— 缓存落在
+       DATA_DIR 下,新进程起来直接接着用。 */
+    // 目录由用例自己拿着:两个 harness 都别删它,才能演「重启后接着用」
+    const dataDir = await mkdtemp(join(tmpdir(), 'aipm-anno-cache-'));
+    const first = await makeHarness({ TYPESAFE_API_KEY: 'tk' }, dataDir);
+    try {
+      const payload = JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS });
+      const res = await api(first, '/api/highlight/suggest', { method: 'POST', body: payload });
+      eq(res.body.cached, undefined, '第一次是真判');
+      await first.highlight.flushCache();
+      const onDisk = JSON.parse(await readFile(join(dataDir, 'highlight-cache.json'), 'utf8'));
+      eq(onDisk.version, 1, '缓存文件带版本号');
+      ok(onDisk.entries.length >= 1, '写进了至少一条');
+    } finally {
+      await first.close();
+    }
+
+    // 同一个 DATA_DIR 起一个新进程:缓存该被捡回来
+    const second = await makeHarness({ TYPESAFE_API_KEY: 'tk' }, dataDir);
+    try {
+      const loaded = await second.highlight.loadCache();
+      eq(loaded.loaded, 1, '加载回一条');
+      const res = await api(second, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS }),
+      });
+      eq(res.status, 200, '应 200');
+      eq(res.body.cached, true, '新进程也命中');
+      eq(second.jev.calls, 0, 'provider 没被再叫一次');
+    } finally {
+      await second.close();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  await test('判分缓存加载:过期条目、坏形状一律丢掉,不挡启动', async () => {
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      const file = join(h.dataDir, 'highlight-cache.json');
+      await writeFile(
+        file,
+        JSON.stringify({
+          version: 1,
+          entries: [
+            { key: 'gone', expiresAt: h.clock.ms - 1, body: { judge: 'jev', suggestions: [], degraded: [] } },
+            { key: 'broken', expiresAt: h.clock.ms + 60_000, body: { judge: 'jev' } },
+            { nope: true },
+            { key: 'live', expiresAt: h.clock.ms + 60_000, body: { judge: 'jev', suggestions: [], degraded: [] } },
+          ],
+        }),
+        'utf8',
+      );
+      const loaded = await h.highlight.loadCache();
+      eq(loaded.loaded, 1, '只留没过期、形状对的那条');
+      eq(loaded.dropped, 3, '其余三条计入丢弃');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('判分缓存文件损坏时按空缓存起步', async () => {
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      await writeFile(join(h.dataDir, 'highlight-cache.json'), '{ 这不是 JSON', 'utf8');
+      const loaded = await h.highlight.loadCache();
+      eq(loaded.loaded, 0, '解析不了就当没有');
+      eq(loaded.dropped, 0, '不算丢弃(整份都不认)');
+      const res = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS }),
+      });
+      eq(res.status, 200, '服务照常判分');
     } finally {
       await h.close();
     }

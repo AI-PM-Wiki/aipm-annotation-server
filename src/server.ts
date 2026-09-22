@@ -26,6 +26,7 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { loadConfig } from './config.ts';
@@ -978,6 +979,7 @@ async function main(): Promise<void> {
   const highlight = new HighlightService({
     config,
     index,
+    cachePath: join(config.dataDir, 'highlight-cache.json'),
     judges: {
       jev: new JevJudge({
         apiKey: config.highlight.jevApiKey,
@@ -999,6 +1001,14 @@ async function main(): Promise<void> {
     },
   });
 
+  const cacheLoaded = await highlight.loadCache();
+  if (cacheLoaded.loaded > 0 || cacheLoaded.dropped > 0) {
+    console.log(
+      `[server] 判分缓存加载: ${cacheLoaded.loaded} 条` +
+        `${cacheLoaded.dropped > 0 ? `(丢弃过期/损坏 ${cacheLoaded.dropped} 条)` : ''}`,
+    );
+  }
+
   const { server } = createApp({ config, store, auth, index, highlight });
   server.listen(config.port, config.host, () => {
     console.log(
@@ -1016,7 +1026,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     index.stop();
-    void store.flush().finally(() => {
+    void Promise.all([store.flush(), highlight.flushCache()]).finally(() => {
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 3000).unref();
     });
