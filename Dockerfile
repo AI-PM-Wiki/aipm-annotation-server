@@ -7,6 +7,8 @@
 # 运行所需环境变量(部署时经 .env 注入,见 README「配置」):
 #   GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET(必填;本地开发可用 DEV_AUTH_BYPASS)
 #   TYPESAFE_API_KEY(可选,主判分)/ ANTHROPIC_API_KEY(可选,兜底判分)
+#     兜底判分可指向 Anthropic 兼容端点:ANTHROPIC_BASE_URL + HIGHLIGHT_LLM_MODE=json
+#     (第三方端点忽略结构化输出,必须走纯文本模式,见 README「配置」)
 #   SEARCH_INDEX_URL / ALLOWED_ORIGINS / TRUST_PROXY ...
 #
 # 持久化:DATA_DIR 下的 store.json 必须落在挂载卷上(见 compose),否则重启丢批注。
