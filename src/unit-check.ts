@@ -11,7 +11,7 @@
  *  2. provider 适配:Jev 的 answers → 统一 Suggestion、LLM 的结构化输出校验与
  *     重试一次;
  *  3. 端到端语义(HTTP):三态可见性(私有对他人是 404 而不是 403)、归属校验、
- *     限流与预算、回退与降级、缓存复用。
+ *     限流与预算、回退与降级、缓存复用与覆盖面校验。
  */
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -2627,6 +2627,110 @@ async function suiteHttpJudge(): Promise<void> {
       eq(res.status, 200, '服务照常判分');
     } finally {
       await h.close();
+    }
+  });
+
+  await test('只判过一部分块的缓存,不再被整页请求当整页结果命中', async () => {
+    /* 缓存键只有页面粒度(页面 + 正文哈希 + judge + 色板),不含「这一次送了哪些块」。
+       旧前端会把已经划过线的块从请求里去掉,判回来的一份于是只是整页的子集;
+       后来的整页请求若把它当整页结果摆出去,没送过的那几段在缓存里就永远没有结论
+       —— 既不划线,也不进「未判定」,谁都不知道漏了。现在按「这一份判过哪些块」
+       校验:请求里有一块不在覆盖面内,就按未命中处理,重新判分并覆盖这一格。 */
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      // 旧前端那一笔:页面上 b1 已经划过线,只把 b2 送出去
+      h.jev.handler = async () => ({ suggestions: [suggestion('b2')] });
+      const partial = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: [VALID_BLOCKS[1]!] }),
+      });
+      eq(partial.body.cached, undefined, '第一次是真判');
+      eq(h.jev.calls, 1, 'provider 被调用一次');
+
+      // 后来的整页请求:这一格只判过 b2,盖不住 b1
+      const full = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS }),
+      });
+      eq(full.status, 200, '应 200');
+      eq(full.body.cached, undefined, '缺一块的缓存不算命中');
+      eq(h.jev.calls, 2, '整页重新判了一次');
+      ok(
+        full.body.degraded.some((d: { id: string }) => d.id === 'b1'),
+        '这一轮没拿到建议的 b1 写进未判定,不在结果里凭空消失',
+      );
+
+      // 判完这一格就是整页的了,下一位访客不再花钱
+      const again = await api(h, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS }),
+      });
+      eq(again.body.cached, true, '整页判过之后命中');
+      eq(h.jev.calls, 2, '不再调 provider');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('整页判过、一条建议都没有的缓存仍然直接复用', async () => {
+    /* 覆盖面的依据是「这一轮判过哪些块」,不从 suggestions 反推:一份零建议的完整
+       结果同样算判过 —— 它讲的是「这一页没有值得划线的地方」。要是拿 suggestions
+       反推,b2 这种判过但没结论的块会被当成没判过,这一页每次都要重新花钱。 */
+    const h = await makeHarness({ TYPESAFE_API_KEY: 'tk' });
+    try {
+      h.jev.handler = async () => ({ suggestions: [] });
+      const payload = JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS });
+      const first = await api(h, '/api/highlight/suggest', { method: 'POST', body: payload });
+      eq(first.body.cached, undefined, '第一次是真判');
+      eq(first.body.suggestions.length, 0, '这一份建议为空');
+      eq(h.jev.calls, 1, 'provider 被调用一次');
+
+      const second = await api(h, '/api/highlight/suggest', { method: 'POST', body: payload });
+      eq(second.status, 200, '应 200');
+      eq(second.body.cached, true, '零建议的完整结果照样复用');
+      eq(h.jev.calls, 1, '不再调 provider');
+    } finally {
+      await h.close();
+    }
+  });
+
+  await test('存盘的旧记录没有覆盖面 → 按未命中处理', async () => {
+    /* 这份改动之前写下的记录只记了页面,无从判断它判过哪些块 —— 它可能就是旧前端的
+       一份子集结果。未知覆盖面一律按未命中处理:不拿它当整页结果摆出去,重新判一次
+       把它覆盖成整页的。不手动清空缓存文件:旧记录在覆盖面校验下自己就失效了,
+       往后要么被新的整页结果覆盖掉,要么随 TTL 过期。 */
+    const dataDir = await mkdtemp(join(tmpdir(), 'aipm-anno-coverage-'));
+    const first = await makeHarness({ TYPESAFE_API_KEY: 'tk' }, dataDir);
+    try {
+      const payload = JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS });
+      await api(first, '/api/highlight/suggest', { method: 'POST', body: payload });
+      await first.highlight.flushCache();
+    } finally {
+      await first.close();
+    }
+
+    // 把写到盘上的那一份退回旧格式:条目里没有「判过哪些块」这一项
+    const file = join(dataDir, 'highlight-cache.json');
+    const onDisk = JSON.parse(await readFile(file, 'utf8'));
+    eq(onDisk.entries.length, 1, '先写进去一条');
+    for (const entry of onDisk.entries) delete entry.coverage;
+    await writeFile(file, JSON.stringify(onDisk), 'utf8');
+
+    const second = await makeHarness({ TYPESAFE_API_KEY: 'tk' }, dataDir);
+    try {
+      const loaded = await second.highlight.loadCache();
+      eq(loaded.loaded, 1, '旧记录照常加载,不挡启动');
+      const res = await api(second, '/api/highlight/suggest', {
+        method: 'POST',
+        body: JSON.stringify({ page: PAGE, palette: PALETTE, blocks: VALID_BLOCKS }),
+      });
+      eq(res.status, 200, '应 200');
+      eq(res.body.cached, undefined, '覆盖面未知 → 不算命中');
+      eq(second.jev.calls, 1, '重新判了一次');
+      eq(res.body.suggestions.length, 1, '摆出的是这一轮新判的');
+    } finally {
+      await second.close();
+      await rm(dataDir, { recursive: true, force: true });
     }
   });
 
