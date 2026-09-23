@@ -339,6 +339,10 @@ export class AnnotationStore {
       }
     });
     await this.writeChain;
-    if (this.dirty) await this.flush();
+    if (this.dirty) {
+      void this.flush().catch((err) => {
+        console.error('store_followup_write_failed', err);
+      });
+    }
   }
 }

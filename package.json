@@ -13,6 +13,7 @@
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "unit-check": "tsx src/unit-check.ts",
+    "durability-check": "node --import tsx test/durability-check.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
