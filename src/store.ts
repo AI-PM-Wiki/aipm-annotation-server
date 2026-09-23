@@ -242,8 +242,10 @@ export class AnnotationStore {
   private readonly tmpPath: string;
   private state: StoredState = EMPTY_STATE;
   private writeChain: Promise<void> = Promise.resolve();
-  private dirty = false;
-  private flushing = false;
+  private revision = 0;
+  private persistedRevision = 0;
+  private inFlightRevision = 0;
+  private persistedAnnotationIds = new Set<string>();
   private lastWriteError: string | null = null;
 
   constructor(dataDir: string) {
@@ -257,6 +259,10 @@ export class AnnotationStore {
 
   get lastError(): string | null {
     return this.lastWriteError;
+  }
+
+  hasPersistedAnnotation(id: string): boolean {
+    return this.persistedAnnotationIds.has(id);
   }
 
   /** 启动加载:文件不存在按空库起步(首次部署无需预置文件)。 */
@@ -274,6 +280,7 @@ export class AnnotationStore {
     }
     const { state, dropped } = parseState(raw);
     this.state = state;
+    this.persistedAnnotationIds = new Set(state.annotations.map((annotation) => annotation.id));
     return { dropped, annotations: state.annotations.length, sessions: state.sessions.length };
   }
 
@@ -301,48 +308,49 @@ export class AnnotationStore {
   }
 
   private markDirty(): void {
-    this.dirty = true;
+    this.revision++;
   }
 
-  /** 等待当前所有排队写入落盘(单测与优雅退出用)。 */
+  /** 每个调用者等待包含自己调用时状态的保存任务。 */
   async flush(): Promise<void> {
-    if (this.flushing) {
-      await this.writeChain;
-      if (this.dirty) await this.flush();
-      return;
-    }
-    if (!this.dirty) {
-      await this.writeChain;
-      return;
-    }
-    this.flushing = true;
-    this.dirty = false;
-    const payload = JSON.stringify(this.state);
-    this.writeChain = this.writeChain.catch(() => {}).then(async () => {
-      try {
-        await writeFile(this.tmpPath, payload, 'utf8');
-        await rename(this.tmpPath, this.filePath); // 原子替换:读到的一半新一半旧不可能发生
-        this.lastWriteError = null;
-      } catch (err) {
-        this.dirty = true;
-        this.lastWriteError = err instanceof Error ? err.message : 'unknown';
-        console.error(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            event: 'store_write_failed',
-            error: this.lastWriteError,
-          }),
-        );
-        throw err;
-      } finally {
-        this.flushing = false;
+    const requiredRevision = this.revision;
+    while (this.persistedRevision < requiredRevision) {
+      if (this.inFlightRevision < requiredRevision) {
+        const revision = this.revision;
+        const payload = JSON.stringify(this.state);
+        const annotationIds = new Set(this.state.annotations.map((annotation) => annotation.id));
+        this.inFlightRevision = revision;
+        this.writeChain = this.writeChain.catch(() => {}).then(async () => {
+          try {
+            await writeFile(this.tmpPath, payload, 'utf8');
+            await rename(this.tmpPath, this.filePath);
+            this.persistedRevision = revision;
+            this.persistedAnnotationIds = annotationIds;
+            this.lastWriteError = null;
+          } catch (err) {
+            this.lastWriteError = err instanceof Error ? err.message : 'unknown';
+            console.error(JSON.stringify({
+              ts: new Date().toISOString(),
+              event: 'store_write_failed',
+              error: this.lastWriteError,
+            }));
+            throw err;
+          } finally {
+            if (this.inFlightRevision === revision) this.inFlightRevision = 0;
+            if (this.persistedRevision === revision && this.revision > revision &&
+                this.inFlightRevision === 0) {
+              void this.flush().catch((err) => {
+                console.error('store_followup_write_failed', err);
+              });
+            }
+          }
+        });
       }
-    });
-    await this.writeChain;
-    if (this.dirty) {
-      void this.flush().catch((err) => {
-        console.error('store_followup_write_failed', err);
-      });
+      try {
+        await this.writeChain;
+      } catch (err) {
+        if (this.persistedRevision < requiredRevision) throw err;
+      }
     }
   }
 }

@@ -474,6 +474,9 @@ export function createApp(deps: ServerDeps) {
     store.setAnnotations([...store.annotations, record]);
     try {
       await store.flush();
+      if (!store.hasPersistedAnnotation(record.id)) {
+        throw new Error('created annotation missing from persisted snapshot');
+      }
     } catch {
       store.setAnnotations(store.annotations.filter((item) => item.id !== record.id));
       sendError(req, res, 503, 'storage_failed', '批注未能保存', cors);
