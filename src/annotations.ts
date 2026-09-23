@@ -385,8 +385,8 @@ export function applyLike(
 export function toClientJson(
   record: AnnotationRecord,
   actor: Author | null,
-): Omit<AnnotationRecord, 'likes'> & { likeCount: number; likedByMe: boolean } {
-  const { likes, ...rest } = record;
+): Omit<AnnotationRecord, 'likes' | 'requestId'> & { likeCount: number; likedByMe: boolean } {
+  const { likes, requestId, ...rest } = record;
   return {
     ...rest,
     likeCount: likes.length,

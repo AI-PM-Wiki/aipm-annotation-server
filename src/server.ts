@@ -65,6 +65,7 @@ import { HighlightService, normalizeJudgeBlocks, normalizePalette } from './high
 import type { HighlightRequest } from './highlight/index.ts';
 
 const CreateAnnotationSchema = z.object({
+  requestId: z.string().min(8).max(128).regex(/^[A-Za-z0-9_-]+$/).optional(),
   page: z.string().min(1).max(512),
   // 空正文合法:纯高亮没有文字(见 normalizeBody 的 allowEmpty)
   body: z.string().max(20_000),
@@ -350,7 +351,26 @@ export function createApp(deps: ServerDeps) {
     );
   }
 
+  let createQueue: Promise<void> = Promise.resolve();
+
   async function handleCreateAnnotation(
+    req: IncomingMessage,
+    res: ServerResponse,
+    cors: Record<string, string>,
+    actor: Author | null | 'rejected',
+  ): Promise<void> {
+    const previous = createQueue;
+    let release!: () => void;
+    createQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      await handleCreateAnnotationLocked(req, res, cors, actor);
+    } finally {
+      release();
+    }
+  }
+
+  async function handleCreateAnnotationLocked(
     req: IncomingMessage,
     res: ServerResponse,
     cors: Record<string, string>,
@@ -400,6 +420,23 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, selectors.code, selectors.detail, cors);
       return;
     }
+    const requestId = parsed.data.requestId;
+    if (requestId !== undefined) {
+      const previous = store.annotations.find((item) =>
+        item.author.githubId === user.githubId && item.requestId === requestId);
+      if (previous !== undefined) {
+        const same = previous.page === page && previous.body === body.value &&
+          previous.color === color.value && previous.style === style.value &&
+          previous.visibility === visibility.value && previous.target.scope === pageScope &&
+          JSON.stringify(previous.target.selectors) === JSON.stringify(selectors.value);
+        if (!same) {
+          sendError(req, res, 409, 'request_conflict', '请求标识对应的批注内容不一致', cors);
+          return;
+        }
+        writeJson(res, 200, { annotation: toClientJson(previous, user) }, cors);
+        return;
+      }
+    }
     if (store.annotations.length >= config.maxAnnotations) {
       sendError(req, res, 507, 'storage_full', '批注存储已达容量上限', cors);
       return;
@@ -419,6 +456,7 @@ export function createApp(deps: ServerDeps) {
     const now = new Date().toISOString();
     const record: AnnotationRecord = {
       id: newAnnotationId(),
+      requestId,
       page,
       visibility: visibility.value,
       color: color.value,
@@ -434,7 +472,13 @@ export function createApp(deps: ServerDeps) {
       updatedAt: now,
     };
     store.setAnnotations([...store.annotations, record]);
-    await store.flush();
+    try {
+      await store.flush();
+    } catch {
+      store.setAnnotations(store.annotations.filter((item) => item.id !== record.id));
+      sendError(req, res, 503, 'storage_failed', '批注未能保存', cors);
+      return;
+    }
     writeJson(res, 201, { annotation: toClientJson(record, user) }, cors);
   }
 

@@ -13,7 +13,7 @@
  *  3. 端到端语义(HTTP):三态可见性(私有对他人是 404 而不是 403)、归属校验、
  *     限流与预算、回退与降级、缓存复用。
  */
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -2040,6 +2040,120 @@ async function suiteHttpAuth(): Promise<void> {
           headers: { Origin: 'https://evil.example' },
         });
         eq(outside.headers.get('access-control-allow-origin'), null, '白名单外不反射');
+      } finally {
+        await h2.close();
+      }
+    });
+    await test('同一请求标识的并发 HTTP 写入只保留一条记录', async () => {
+      const h2 = await makeHarness({ DEV_AUTH_BYPASS: 'true' });
+      try {
+        const session = await api(h2, '/api/auth/dev', { method: 'POST' });
+        eq(session.status, 200, '开发环境会话可用');
+        const payload = {
+          requestId: '47b83eed-2c84-45bd-aadf-44d0676362cf',
+          page: PAGE, body: '并发整页评论', color: 'yellow', visibility: 'private',
+          target: { selectors: [], scope: 'page' },
+        };
+        const requests = Array.from({ length: 12 }, () => api(h2, '/api/annotations', {
+          method: 'POST', token: session.body.token as string, body: JSON.stringify(payload),
+        }));
+        const responses = await Promise.all(requests);
+        eq(responses.filter((response) => response.status === 201).length, 1, '只创建一次');
+        eq(responses.filter((response) => response.status === 200).length, 11, '其余返回已创建批注');
+        eq(new Set(responses.map((response) => response.body.annotation.id)).size, 1, '所有响应指向同一记录');
+        const disk = new AnnotationStore(h2.config.dataDir);
+        await disk.load();
+        eq(disk.annotations.length, 1, '文件中只有一条记录');
+      } finally {
+        await h2.close();
+      }
+    });
+
+    await test('持久化失败返回错误，重启后相同标识可以重新写入', async () => {
+      const dataDir = await mkdtemp(join(tmpdir(), 'aipm-anno-durable-'));
+      const payload = {
+        requestId: '878f9c86-5e14-4616-bbb1-7cc4504c3a9e',
+        page: PAGE, body: '持久化验证', color: 'yellow', visibility: 'private',
+        target: { selectors: [], scope: 'page' },
+      };
+      try {
+        const h2 = await makeHarness({ DEV_AUTH_BYPASS: 'true' }, dataDir);
+        try {
+          const session = await api(h2, '/api/auth/dev', { method: 'POST' });
+          await mkdir(join(dataDir, 'store.json.tmp'));
+          const rejected = await api(h2, '/api/annotations', {
+            method: 'POST', token: session.body.token as string, body: JSON.stringify(payload),
+          });
+          eq(rejected.status, 503, '持久化失败不返回成功');
+          eq(h2.store.annotations.length, 0, '失败记录不留在内存中');
+        } finally {
+          await h2.close();
+        }
+        await rm(join(dataDir, 'store.json.tmp'), { recursive: true });
+        const restarted = await makeHarness({ DEV_AUTH_BYPASS: 'true' }, dataDir);
+        try {
+          eq(restarted.store.annotations.length, 0, '重启没有失败记录');
+          const session = await api(restarted, '/api/auth/dev', { method: 'POST' });
+          const created = await api(restarted, '/api/annotations', {
+            method: 'POST', token: session.body.token as string, body: JSON.stringify(payload),
+          });
+          eq(created.status, 201, '重启后相同标识写入成功');
+          const disk = new AnnotationStore(dataDir);
+          await disk.load();
+          eq(disk.annotations.length, 1, '重新写入已持久化');
+        } finally {
+          await restarted.close();
+        }
+      } finally {
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    });
+
+    await test('重复提交同一 requestId 只产生一条记录,内容冲突被拒绝', async () => {
+      const h2 = await makeHarness({ DEV_AUTH_BYPASS: 'true' });
+      try {
+        const session = await api(h2, '/api/auth/dev', { method: 'POST' });
+        eq(session.status, 200, '获取开发环境登录会话');
+        const token = session.body.token as string;
+        const payload = {
+          requestId: 'eb97b113-2b38-4e50-955f-40eaa1a790a3',
+          page: PAGE,
+          body: '可恢复的整页评论',
+          color: 'yellow',
+          visibility: 'private',
+          target: { selectors: [], scope: 'page' },
+        };
+        const send = (body: typeof payload) => api(h2, '/api/annotations', {
+          method: 'POST', token, body: JSON.stringify(body),
+        });
+        const first = await send(payload);
+        eq(first.status, 201, '首次创建');
+        eq(Object.hasOwn(first.body.annotation, 'requestId'), false, '内部请求标识不对外回传');
+        const reloaded = new AnnotationStore(h2.config.dataDir);
+        await reloaded.load();
+        eq(reloaded.annotations[0]?.requestId, payload.requestId, '重启后请求标识保留');
+        const repeated = await send(payload);
+        eq(repeated.status, 200, '重试返回已有记录');
+        eq(repeated.body.annotation.id, first.body.annotation.id, '返回同一批注');
+        eq(h2.store.annotations.length, 1, '实际只写入一次');
+        const changed = await send({ ...payload, visibility: 'public' });
+        eq(changed.status, 409, '同一标识不得修改可见范围');
+        eq(h2.store.annotations.length, 1, '冲突不产生写入');
+        const anonymous = await api(h2, '/api/annotations', {
+          method: 'POST', body: JSON.stringify(payload),
+        });
+        eq(anonymous.status, 401, '重试依然需要用户身份');
+        const otherToken = h2.auth.issueSession({ githubId: 42, login: 'other-reader' });
+        const other = await api(h2, '/api/annotations', {
+          method: 'POST', token: otherToken, body: JSON.stringify(payload),
+        });
+        eq(other.status, 201, '不同用户持有相同请求标识时可独立创建');
+        ok(other.body.annotation.id !== first.body.annotation.id, '两位用户的记录各自独立');
+        eq(other.body.annotation.author.githubId, 42, '作者由登录会话确定');
+        const privateRead = await api(h2, `/api/annotations/${first.body.annotation.id}`, {
+          token: otherToken,
+        });
+        eq(privateRead.status, 404, '其他用户无法读取私有记录');
       } finally {
         await h2.close();
       }

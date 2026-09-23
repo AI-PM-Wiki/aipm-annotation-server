@@ -58,6 +58,7 @@ export interface Reply {
 
 export interface AnnotationRecord {
   id: string;
+  requestId?: string;
   /** 站点路径,如 "/ai/rag/"。 */
   page: string;
   visibility: Visibility;
@@ -202,6 +203,7 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
   const now = new Date(0).toISOString();
   return {
     id,
+    requestId: typeof value.requestId === 'string' ? value.requestId : undefined,
     page,
     visibility,
     color: typeof color === 'string' && color.length > 0 ? color : 'yellow',
@@ -304,23 +306,25 @@ export class AnnotationStore {
 
   /** 等待当前所有排队写入落盘(单测与优雅退出用)。 */
   async flush(): Promise<void> {
-    if (!this.dirty) {
+    if (this.flushing) {
       await this.writeChain;
+      if (this.dirty) await this.flush();
       return;
     }
-    if (this.flushing) {
+    if (!this.dirty) {
       await this.writeChain;
       return;
     }
     this.flushing = true;
     this.dirty = false;
     const payload = JSON.stringify(this.state);
-    this.writeChain = this.writeChain.then(async () => {
+    this.writeChain = this.writeChain.catch(() => {}).then(async () => {
       try {
         await writeFile(this.tmpPath, payload, 'utf8');
         await rename(this.tmpPath, this.filePath); // 原子替换:读到的一半新一半旧不可能发生
         this.lastWriteError = null;
       } catch (err) {
+        this.dirty = true;
         this.lastWriteError = err instanceof Error ? err.message : 'unknown';
         console.error(
           JSON.stringify({
@@ -329,12 +333,12 @@ export class AnnotationStore {
             error: this.lastWriteError,
           }),
         );
+        throw err;
       } finally {
         this.flushing = false;
-        // 落盘期间又有新修改:再冲一次
-        if (this.dirty) void this.flush();
       }
     });
     await this.writeChain;
+    if (this.dirty) await this.flush();
   }
 }
