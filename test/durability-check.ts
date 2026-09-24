@@ -96,6 +96,12 @@ try {
     const restartedBody = await restartedResponse.json();
     result.newProcessPublicCount = restartedBody.annotations.length;
     assert.equal(result.newProcessPublicCount, 1);
+    const receipt = await fetch(`${base}/api/annotation-requests/review-request-partial-flush`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(receipt.status, 200);
+    assert.equal((await receipt.json()).operation.annotationId, body.annotation.id);
+
   } finally {
     if (child.exitCode === null) {
       child.kill("SIGTERM");
@@ -109,6 +115,9 @@ try {
   assert.equal(body.annotation.id, disk.annotations[0]?.id);
   assert.equal(store.annotations.length, 1);
   assert.equal(disk.annotations.length, 1);
+  assert.equal(disk.operations.length, 1);
+  assert.equal(disk.operations[0]?.annotationId, body.annotation.id);
+
 } finally {
   watcher?.close();
   index.stop();

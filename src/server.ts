@@ -6,6 +6,8 @@
  *   GET    /api/auth/github/start?return=     302 → GitHub 授权页
  *   GET    /api/auth/github/callback?code=&state=  换 token → 建会话 → 302 回站点
  *   POST   /api/auth/session                  {code} 一次性 code 换 bearer token
+ *   GET    /api/annotation-requests/:requestId  需本人会话，只读操作记录
+
  *   GET    /api/auth/me                       当前用户(未登录 401)
  *   POST   /api/auth/logout                   吊销会话
  *   POST   /api/auth/dev                      仅回环 + DEV_AUTH_BYPASS 时可用,直接发 token
@@ -28,12 +30,12 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { loadConfig } from './config.ts';
 import type { Config } from './config.ts';
 import { AnnotationStore } from './store.ts';
-import type { AnnotationRecord, Author } from './store.ts';
+import type { AnnotationRecord, Author, OperationRecord } from './store.ts';
 import { AuthService, sanitizeReturn } from './auth.ts';
 import { canonicalPage } from './index-store.ts';
 import type { IndexLike } from './index-store.ts';
@@ -420,8 +422,30 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, selectors.code, selectors.detail, cors);
       return;
     }
+    const digest = createHash('sha256').update(JSON.stringify({
+      page, body: body.value, color: color.value, style: style.value,
+      visibility: visibility.value, scope: pageScope ?? null, selectors: selectors.value,
+    })).digest('hex');
+
     const requestId = parsed.data.requestId;
     if (requestId !== undefined) {
+      const operation = store.operations.find((item) =>
+        item.githubId === user.githubId && item.requestId === requestId);
+      if (operation !== undefined) {
+        if (operation.digest !== digest) {
+          sendError(req, res, 409, 'request_conflict', '请求标识对应的批注内容不一致', cors);
+          return;
+        }
+        const original = store.annotations.find((item) => item.id === operation.annotationId);
+        if (original === undefined) {
+          writeJson(res, 200, { operation: { status: 'succeeded',
+            annotationId: operation.annotationId, deleted: true } }, cors);
+        } else {
+          writeJson(res, 200, { annotation: toClientJson(original, user) }, cors);
+        }
+        return;
+      }
+
       const previous = store.annotations.find((item) =>
         item.author.githubId === user.githubId && item.requestId === requestId);
       if (previous !== undefined) {
@@ -471,14 +495,18 @@ export function createApp(deps: ServerDeps) {
       createdAt: now,
       updatedAt: now,
     };
-    store.setAnnotations([...store.annotations, record]);
+    const operation: OperationRecord | undefined = requestId === undefined ? undefined : {
+      githubId: user.githubId, requestId, annotationId: record.id, digest,
+      page, visibility: visibility.value, createdAt: now,
+    };
+    store.addAnnotationWithOperation(record, operation);
     try {
       await store.flush();
       if (!store.hasPersistedAnnotation(record.id)) {
         throw new Error('created annotation missing from persisted snapshot');
       }
     } catch {
-      store.setAnnotations(store.annotations.filter((item) => item.id !== record.id));
+      store.removeAnnotationWithOperation(record.id, operation);
       sendError(req, res, 503, 'storage_failed', '批注未能保存', cors);
       return;
     }
@@ -973,6 +1001,36 @@ export function createApp(deps: ServerDeps) {
         return;
       }
     }
+
+    const operationMatch = /^\/api\/annotation-requests\/([^/]+)$/.exec(path);
+    if (operationMatch !== null && method === 'GET') {
+      const actor = authenticate(req, res, cors);
+      const user = requireLogin(req, res, cors, actor);
+      if (user === null) return;
+      const requestId = operationMatch[1]!;
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId)) {
+        sendError(req, res, 400, 'bad_request', '请求标识格式不正确', cors);
+        return;
+      }
+      const operation = store.operations.find((item) =>
+        item.githubId === user.githubId && item.requestId === requestId);
+      if (operation === undefined) {
+        sendError(req, res, 404, 'not_found', '操作记录不存在', cors);
+        return;
+      }
+      if (!store.hasPersistedOperation(user.githubId, requestId)) {
+        writeJson(res, 200, { operation: { status: 'pending' } }, cors);
+        return;
+      }
+      writeJson(res, 200, { operation: {
+        status: 'succeeded', annotationId: operation.annotationId,
+        page: operation.page, visibility: operation.visibility,
+        createdAt: operation.createdAt,
+        deleted: !store.annotations.some((item) => item.id === operation.annotationId),
+      } }, cors);
+      return;
+    }
+
 
     const annotationMatch = /^\/api\/annotations\/([^/]+)$/.exec(path);
     if (annotationMatch !== null) {

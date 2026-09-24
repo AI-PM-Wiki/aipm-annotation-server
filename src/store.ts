@@ -10,6 +10,7 @@
  * 并用 dirty 标记把同一 tick 内的多次修改合并成一次落盘。
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
 export type Visibility = 'public' | 'private';
@@ -92,14 +93,25 @@ export interface SessionRecord {
   revoked: boolean;
 }
 
+export interface OperationRecord {
+  githubId: number;
+  requestId: string;
+  annotationId: string;
+  digest: string;
+  page: string;
+  visibility: Visibility;
+  createdAt: string;
+}
+
 /** 落盘结构。带 version 便于日后迁移。 */
 export interface StoredState {
   version: 1;
   annotations: AnnotationRecord[];
   sessions: SessionRecord[];
+  operations: OperationRecord[];
 }
 
-const EMPTY_STATE: StoredState = { version: 1, annotations: [], sessions: [] };
+const EMPTY_STATE: StoredState = { version: 1, annotations: [], sessions: [], operations: [] };
 
 /** 单条批注的点赞数上限。存储文件可能被手工编辑,解析时不设上限就是给自己挖坑。 */
 const MAX_LIKES = 50_000;
@@ -123,6 +135,7 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
   if (!isRecord(json)) throw new Error('存储文件顶层不是对象');
   const annotations: AnnotationRecord[] = [];
   const sessions: SessionRecord[] = [];
+  const operations: OperationRecord[] = [];
   let dropped = 0;
 
   const rawAnnotations = Array.isArray(json.annotations) ? json.annotations : [];
@@ -137,7 +150,45 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
     if (s === null) dropped++;
     else sessions.push(s);
   }
-  return { state: { version: 1, annotations, sessions }, dropped };
+  if (json.operations !== undefined && !Array.isArray(json.operations)) {
+    throw new Error('操作记录结构无效');
+  }
+  for (const item of (json.operations ?? []) as unknown[]) {
+    if (!isRecord(item) || typeof item.githubId !== 'number' ||
+        !Number.isSafeInteger(item.githubId) || typeof item.requestId !== 'string' ||
+        typeof item.annotationId !== 'string' || typeof item.digest !== 'string' ||
+        typeof item.page !== 'string' ||
+        (item.visibility !== 'public' && item.visibility !== 'private') ||
+        typeof item.createdAt !== 'string') {
+      throw new Error('操作记录损坏');
+    }
+    if (operations.some((record) => record.githubId === item.githubId &&
+        record.requestId === item.requestId)) throw new Error('操作记录标识重复');
+    operations.push({ githubId: item.githubId, requestId: item.requestId,
+      annotationId: item.annotationId, digest: item.digest,
+      page: item.page, visibility: item.visibility, createdAt: item.createdAt });
+  }
+
+  for (const annotation of annotations) {
+    if (annotation.requestId === undefined) continue;
+    const existing = operations.find((record) => record.githubId === annotation.author.githubId &&
+      record.requestId === annotation.requestId);
+    if (existing !== undefined) {
+      if (existing.annotationId !== annotation.id) throw new Error('操作记录标识重复');
+      continue;
+    }
+
+    const digest = createHash('sha256').update(JSON.stringify({
+      page: annotation.page, body: annotation.body, color: annotation.color,
+      style: annotation.style, visibility: annotation.visibility,
+      scope: annotation.target.scope ?? null, selectors: annotation.target.selectors,
+    })).digest('hex');
+    operations.push({ githubId: annotation.author.githubId,
+      requestId: annotation.requestId, annotationId: annotation.id, digest,
+      page: annotation.page, visibility: annotation.visibility, createdAt: annotation.createdAt });
+  }
+
+  return { state: { version: 1, annotations, sessions, operations }, dropped };
 }
 
 function parseAuthor(value: unknown): Author | null {
@@ -246,6 +297,7 @@ export class AnnotationStore {
   private persistedRevision = 0;
   private inFlightRevision = 0;
   private persistedAnnotationIds = new Set<string>();
+  private persistedOperations = new Set<string>();
   private lastWriteError: string | null = null;
 
   constructor(dataDir: string) {
@@ -261,6 +313,10 @@ export class AnnotationStore {
     return this.lastWriteError;
   }
 
+  hasPersistedOperation(githubId: number, requestId: string): boolean {
+    return this.persistedOperations.has(`${githubId}:${requestId}`);
+  }
+
   hasPersistedAnnotation(id: string): boolean {
     return this.persistedAnnotationIds.has(id);
   }
@@ -273,7 +329,7 @@ export class AnnotationStore {
       raw = await readFile(this.filePath, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        this.state = { version: 1, annotations: [], sessions: [] };
+        this.state = { version: 1, annotations: [], sessions: [], operations: [] };
         return { dropped: 0, annotations: 0, sessions: 0 };
       }
       throw err;
@@ -281,6 +337,8 @@ export class AnnotationStore {
     const { state, dropped } = parseState(raw);
     this.state = state;
     this.persistedAnnotationIds = new Set(state.annotations.map((annotation) => annotation.id));
+    this.persistedOperations = new Set(state.operations.map((operation) =>
+      `${operation.githubId}:${operation.requestId}`));
     return { dropped, annotations: state.annotations.length, sessions: state.sessions.length };
   }
 
@@ -295,6 +353,24 @@ export class AnnotationStore {
 
   get sessions(): SessionRecord[] {
     return this.state.sessions;
+  }
+
+  get operations(): OperationRecord[] {
+    return this.state.operations;
+  }
+
+  addAnnotationWithOperation(annotation: AnnotationRecord, operation?: OperationRecord): void {
+    this.state = { ...this.state, annotations: [...this.state.annotations, annotation],
+      operations: operation === undefined ? this.state.operations : [...this.state.operations, operation] };
+    this.markDirty();
+  }
+
+  removeAnnotationWithOperation(annotationId: string, operation?: OperationRecord): void {
+    this.state = { ...this.state,
+      annotations: this.state.annotations.filter((item) => item.id !== annotationId),
+      operations: operation === undefined ? this.state.operations :
+        this.state.operations.filter((item) => item !== operation) };
+    this.markDirty();
   }
 
   setAnnotations(annotations: AnnotationRecord[]): void {
@@ -319,6 +395,8 @@ export class AnnotationStore {
         const revision = this.revision;
         const payload = JSON.stringify(this.state);
         const annotationIds = new Set(this.state.annotations.map((annotation) => annotation.id));
+        const operationKeys = new Set(this.state.operations.map((operation) =>
+          `${operation.githubId}:${operation.requestId}`));
         this.inFlightRevision = revision;
         this.writeChain = this.writeChain.catch(() => {}).then(async () => {
           try {
@@ -326,6 +404,7 @@ export class AnnotationStore {
             await rename(this.tmpPath, this.filePath);
             this.persistedRevision = revision;
             this.persistedAnnotationIds = annotationIds;
+            this.persistedOperations = operationKeys;
             this.lastWriteError = null;
           } catch (err) {
             this.lastWriteError = err instanceof Error ? err.message : 'unknown';

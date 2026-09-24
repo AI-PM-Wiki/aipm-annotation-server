@@ -1,5 +1,7 @@
 # AI-PM Annotation Server
 
+站内 wikiAgent 的操作记录、本人查询与用户许可规则参见 [操作记录与许可约定](docs/operation-record.md)。
+
 [AI-PM Wiki](https://aipm.ac) 的自建批注后端:GitHub OAuth 登录 + 公开/私有批注存储 + 智能高亮 judge。
 与 [aipm-agent-server](https://github.com/AI-PM-Wiki/aipm-agent-server)(文档问答后端)并列的第二个自建服务,
 在主仓库 [AI-PM-Wiki/AIPM](https://github.com/AI-PM-Wiki/AIPM) 里以子模块 `annotation-server/` 挂载。

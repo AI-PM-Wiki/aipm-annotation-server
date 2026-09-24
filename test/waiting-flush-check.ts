@@ -109,6 +109,12 @@ try {
     });
     const restartedResponse = await fetch(`${base}/api/annotations?page=/ai/rag/&scope=public`);
     const restartedBody = await restartedResponse.json();
+    const receipt = await fetch(`${base}/api/annotation-requests/review-request-waiting-flush`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(receipt.status, injectFailure ? 404 : 200);
+    if (!injectFailure) assert.equal((await receipt.json()).operation.annotationId, body.annotation.id);
+
     result.newProcessPublicCount = restartedBody.annotations.length;
   } finally {
     if (child.exitCode === null) {
@@ -122,6 +128,9 @@ try {
   assert.equal(response.statusCode, injectFailure ? 503 : 201);
   assert.equal(result.newProcessPublicCount, disk.annotations.length);
   assert.equal(store.annotations.length, disk.annotations.length);
+  assert.equal(disk.operations.length, injectFailure ? 0 : 1);
+  assert.equal(store.operations.length, disk.operations.length);
+
   assert.equal(response.statusCode === 201, disk.annotations.length === 1,
     "A successful create must exist after restart");
 } finally {
