@@ -25,4 +25,6 @@ Agent 不提供编辑或删除入口。今后如提供删除，须有用户明�
 `GET /api/annotation-requests/:requestId` 需要原账号的 Bearer 会话；未登录返回 401，标识无效返回 400，本人无记录返回 404。查询无写入副作用，无须提供当前文章或 DOM 选区。返回 `operation.status` 为 `pending` 或 `succeeded`；持久化成功且具有原创建依据时回传 `annotationId`、原 `page`、原 `visibility`、原 `createdAt` 以及已保存快照中的 `deleted` 状态，均不含正文或请求摘要。`pending` 不构成成功依据；404 也不能证明网络中的原请求不会抵达。该接口仅提供已存储的操作记录，浏览器负责保持未知状态与许可依据。服务端单实例文件存储，跨进程并发不在本轮保证范围内。
 
 
+`p2-regression.mjs` 的真实 HTTP 回归从旧服务创建并编辑批注，检验升级后原请求依据、重试与删除墓碑；另以目录占用 `store.json.tmp` 复现文件故障，检验同进程查询、重复请求与重启后的保存状态。执行时准备与当前检出同级的 `legacy`（检出 `83aefe2d4ede9ef0782c46d8569923fc080d71f0`），在父目录提供 `site/search/search_index.json`、`runtime/`、`logs/`；两个检出均安装依赖。
+
 本地验证：`npm run typecheck`、`npm run unit-check`、`npm run durability-check`、`node --import tsx test/operation-record-check.ts`、`node test/p2-regression.mjs`。最后一项使用构建出的 `../site/search/search_index.json`，覆盖本人隔离、真实 HTTP、同标识并发、服务重启、编辑、删除及操作记录保留。
