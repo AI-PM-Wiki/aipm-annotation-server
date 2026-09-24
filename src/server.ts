@@ -429,35 +429,23 @@ export function createApp(deps: ServerDeps) {
 
     const requestId = parsed.data.requestId;
     if (requestId !== undefined) {
-      const operation = store.operations.find((item) =>
+      const pending = store.operations.find((item) =>
         item.githubId === user.githubId && item.requestId === requestId);
-      if (operation !== undefined) {
-        if (operation.digest !== digest) {
-          sendError(req, res, 409, 'request_conflict', '请求标识对应的批注内容不一致', cors);
+      if (pending !== undefined) {
+        if (store.getPersistedOperation(user.githubId, requestId) === undefined) await store.flush();
+        const operation = store.getPersistedOperation(user.githubId, requestId);
+        if (operation === undefined) throw new Error('operation missing from persisted snapshot');
+        if (operation.evidence !== 'original' || operation.digest !== digest) {
+          sendError(req, res, 409, 'request_conflict', '原创建请求无法核验或内容不一致', cors);
           return;
         }
-        const original = store.annotations.find((item) => item.id === operation.annotationId);
+        const original = store.getPersistedAnnotation(operation.annotationId);
         if (original === undefined) {
           writeJson(res, 200, { operation: { status: 'succeeded',
             annotationId: operation.annotationId, deleted: true } }, cors);
         } else {
           writeJson(res, 200, { annotation: toClientJson(original, user) }, cors);
         }
-        return;
-      }
-
-      const previous = store.annotations.find((item) =>
-        item.author.githubId === user.githubId && item.requestId === requestId);
-      if (previous !== undefined) {
-        const same = previous.page === page && previous.body === body.value &&
-          previous.color === color.value && previous.style === style.value &&
-          previous.visibility === visibility.value && previous.target.scope === pageScope &&
-          JSON.stringify(previous.target.selectors) === JSON.stringify(selectors.value);
-        if (!same) {
-          sendError(req, res, 409, 'request_conflict', '请求标识对应的批注内容不一致', cors);
-          return;
-        }
-        writeJson(res, 200, { annotation: toClientJson(previous, user) }, cors);
         return;
       }
     }
@@ -496,7 +484,7 @@ export function createApp(deps: ServerDeps) {
       updatedAt: now,
     };
     const operation: OperationRecord | undefined = requestId === undefined ? undefined : {
-      githubId: user.githubId, requestId, annotationId: record.id, digest,
+      githubId: user.githubId, requestId, annotationId: record.id, digest, evidence: 'original',
       page, visibility: visibility.value, createdAt: now,
     };
     store.addAnnotationWithOperation(record, operation);
@@ -1012,21 +1000,23 @@ export function createApp(deps: ServerDeps) {
         sendError(req, res, 400, 'bad_request', '请求标识格式不正确', cors);
         return;
       }
-      const operation = store.operations.find((item) =>
-        item.githubId === user.githubId && item.requestId === requestId);
+      const operation = store.getPersistedOperation(user.githubId, requestId);
       if (operation === undefined) {
-        sendError(req, res, 404, 'not_found', '操作记录不存在', cors);
-        return;
-      }
-      if (!store.hasPersistedOperation(user.githubId, requestId)) {
-        writeJson(res, 200, { operation: { status: 'pending' } }, cors);
+        if (store.operations.some((item) => item.githubId === user.githubId &&
+            item.requestId === requestId)) {
+          writeJson(res, 200, { operation: { status: 'pending' } }, cors);
+        } else {
+          sendError(req, res, 404, 'not_found', '操作记录不存在', cors);
+        }
         return;
       }
       writeJson(res, 200, { operation: {
         status: 'succeeded', annotationId: operation.annotationId,
-        page: operation.page, visibility: operation.visibility,
+        ...(operation.evidence === 'original'
+          ? { page: operation.page, visibility: operation.visibility }
+          : { originalRequestKnown: false }),
         createdAt: operation.createdAt,
-        deleted: !store.annotations.some((item) => item.id === operation.annotationId),
+        deleted: store.getPersistedAnnotation(operation.annotationId) === undefined,
       } }, cors);
       return;
     }

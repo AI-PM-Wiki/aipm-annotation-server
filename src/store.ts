@@ -10,7 +10,6 @@
  * 并用 dirty 标记把同一 tick 内的多次修改合并成一次落盘。
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
 export type Visibility = 'public' | 'private';
@@ -97,9 +96,10 @@ export interface OperationRecord {
   githubId: number;
   requestId: string;
   annotationId: string;
-  digest: string;
+  evidence: 'original' | 'legacy';
+  digest: string | null;
   page: string;
-  visibility: Visibility;
+  visibility: Visibility | null;
   createdAt: string;
 }
 
@@ -156,17 +156,25 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
   for (const item of (json.operations ?? []) as unknown[]) {
     if (!isRecord(item) || typeof item.githubId !== 'number' ||
         !Number.isSafeInteger(item.githubId) || typeof item.requestId !== 'string' ||
-        typeof item.annotationId !== 'string' || typeof item.digest !== 'string' ||
-        typeof item.page !== 'string' ||
-        (item.visibility !== 'public' && item.visibility !== 'private') ||
-        typeof item.createdAt !== 'string') {
+        typeof item.annotationId !== 'string' || typeof item.page !== 'string' ||
+        typeof item.createdAt !== 'string' ||
+        (item.evidence !== undefined && item.evidence !== 'original' && item.evidence !== 'legacy') ||
+        (item.digest !== null && typeof item.digest !== 'string') ||
+        (item.visibility !== null && item.visibility !== 'public' && item.visibility !== 'private')) {
       throw new Error('操作记录损坏');
     }
     if (operations.some((record) => record.githubId === item.githubId &&
         record.requestId === item.requestId)) throw new Error('操作记录标识重复');
+    const evidence = item.evidence === 'original' ? 'original' : 'legacy';
+    if (evidence === 'original' && (typeof item.digest !== 'string' ||
+        (item.visibility !== 'public' && item.visibility !== 'private'))) {
+      throw new Error('操作记录损坏');
+    }
     operations.push({ githubId: item.githubId, requestId: item.requestId,
-      annotationId: item.annotationId, digest: item.digest,
-      page: item.page, visibility: item.visibility, createdAt: item.createdAt });
+      annotationId: item.annotationId, evidence,
+      digest: evidence === 'original' ? item.digest as string : null,
+      page: item.page, visibility: evidence === 'original' ? item.visibility as Visibility : null,
+      createdAt: item.createdAt });
   }
 
   for (const annotation of annotations) {
@@ -178,14 +186,10 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
       continue;
     }
 
-    const digest = createHash('sha256').update(JSON.stringify({
-      page: annotation.page, body: annotation.body, color: annotation.color,
-      style: annotation.style, visibility: annotation.visibility,
-      scope: annotation.target.scope ?? null, selectors: annotation.target.selectors,
-    })).digest('hex');
     operations.push({ githubId: annotation.author.githubId,
-      requestId: annotation.requestId, annotationId: annotation.id, digest,
-      page: annotation.page, visibility: annotation.visibility, createdAt: annotation.createdAt });
+      requestId: annotation.requestId, annotationId: annotation.id,
+      evidence: 'legacy', digest: null, page: annotation.page,
+      visibility: null, createdAt: annotation.createdAt });
   }
 
   return { state: { version: 1, annotations, sessions, operations }, dropped };
@@ -296,8 +300,7 @@ export class AnnotationStore {
   private revision = 0;
   private persistedRevision = 0;
   private inFlightRevision = 0;
-  private persistedAnnotationIds = new Set<string>();
-  private persistedOperations = new Set<string>();
+  private persistedState: StoredState = EMPTY_STATE;
   private lastWriteError: string | null = null;
 
   constructor(dataDir: string) {
@@ -313,12 +316,17 @@ export class AnnotationStore {
     return this.lastWriteError;
   }
 
-  hasPersistedOperation(githubId: number, requestId: string): boolean {
-    return this.persistedOperations.has(`${githubId}:${requestId}`);
+  getPersistedOperation(githubId: number, requestId: string): OperationRecord | undefined {
+    return this.persistedState.operations.find((item) =>
+      item.githubId === githubId && item.requestId === requestId);
+  }
+
+  getPersistedAnnotation(id: string): AnnotationRecord | undefined {
+    return this.persistedState.annotations.find((item) => item.id === id);
   }
 
   hasPersistedAnnotation(id: string): boolean {
-    return this.persistedAnnotationIds.has(id);
+    return this.getPersistedAnnotation(id) !== undefined;
   }
 
   /** 启动加载:文件不存在按空库起步(首次部署无需预置文件)。 */
@@ -330,15 +338,14 @@ export class AnnotationStore {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         this.state = { version: 1, annotations: [], sessions: [], operations: [] };
+    this.persistedState = this.state;
         return { dropped: 0, annotations: 0, sessions: 0 };
       }
       throw err;
     }
     const { state, dropped } = parseState(raw);
     this.state = state;
-    this.persistedAnnotationIds = new Set(state.annotations.map((annotation) => annotation.id));
-    this.persistedOperations = new Set(state.operations.map((operation) =>
-      `${operation.githubId}:${operation.requestId}`));
+    this.persistedState = state;
     return { dropped, annotations: state.annotations.length, sessions: state.sessions.length };
   }
 
@@ -394,17 +401,14 @@ export class AnnotationStore {
       if (this.inFlightRevision < requiredRevision) {
         const revision = this.revision;
         const payload = JSON.stringify(this.state);
-        const annotationIds = new Set(this.state.annotations.map((annotation) => annotation.id));
-        const operationKeys = new Set(this.state.operations.map((operation) =>
-          `${operation.githubId}:${operation.requestId}`));
+        const snapshot = this.state;
         this.inFlightRevision = revision;
         this.writeChain = this.writeChain.catch(() => {}).then(async () => {
           try {
             await writeFile(this.tmpPath, payload, 'utf8');
             await rename(this.tmpPath, this.filePath);
             this.persistedRevision = revision;
-            this.persistedAnnotationIds = annotationIds;
-            this.persistedOperations = operationKeys;
+            this.persistedState = snapshot;
             this.lastWriteError = null;
           } catch (err) {
             this.lastWriteError = err instanceof Error ? err.message : 'unknown';

@@ -20,6 +20,9 @@ Agent 不提供编辑或删除入口。今后如提供删除，须有用户明�
 
 `POST /api/annotations` 可以携带 `requestId`（八至一百二十八位字母、数字、下划线或连字符）。相同 `(githubId, requestId)` 与相同规范化请求至多创建一条批注，内容不同返回 `409 request_conflict`。另一身份使用相同标识拥有自己的独立操作记录。创建时将请求摘要、原批注标识、原文章、原可见范围及原创建时间与批注一起原子保存。摘要采用 SHA-256，记录不保存额外正文或选区副本。编辑或删除批注保留原创建记录，旧标识不得重建已删除内容。
 
-`GET /api/annotation-requests/:requestId` 需要原账号的 Bearer 会话；未登录返回 401，标识无效返回 400，本人无记录返回 404。查询无写入副作用，无须提供当前文章或 DOM 选区。返回 `operation.status` 为 `pending` 或 `succeeded`；持久化成功时回传 `annotationId`、原 `page`、原 `visibility`、原 `createdAt` 以及当前 `deleted` 状态，均不含正文或请求摘要。`pending` 不构成成功依据；404 也不能证明网络中的原请求不会抵达。该接口仅提供已存储的操作记录，浏览器负责保持未知状态与许可依据。服务端单实例文件存储，跨进程并发不在本轮保证范围内。
+升级前已有 `requestId` 的批注若缺少原创建依据，查询返回 `succeeded`、`annotationId`、`createdAt`、`deleted` 和 `originalRequestKnown: false`。这只证明旧存储含该批注与标识；原文章、原可见范围及原请求摘要无法从当前批注状态证明，不返回原始字段。此类标识的重复创建返回 409，不会将当前正文认定为原请求，也不会重建已删除的批注。升级前遗留的操作记录若未标注证据类型，同样按原创建依据缺失处理。
 
-本地验证：`npm run typecheck`、`npm run unit-check`、`npm run durability-check`、`node --import tsx test/operation-record-check.ts`。最后一项使用构建出的 `../site/search/search_index.json`，覆盖本人隔离、真实 HTTP、同标识并发、服务重启、编辑、删除及操作记录保留。
+`GET /api/annotation-requests/:requestId` 需要原账号的 Bearer 会话；未登录返回 401，标识无效返回 400，本人无记录返回 404。查询无写入副作用，无须提供当前文章或 DOM 选区。返回 `operation.status` 为 `pending` 或 `succeeded`；持久化成功且具有原创建依据时回传 `annotationId`、原 `page`、原 `visibility`、原 `createdAt` 以及已保存快照中的 `deleted` 状态，均不含正文或请求摘要。`pending` 不构成成功依据；404 也不能证明网络中的原请求不会抵达。该接口仅提供已存储的操作记录，浏览器负责保持未知状态与许可依据。服务端单实例文件存储，跨进程并发不在本轮保证范围内。
+
+
+本地验证：`npm run typecheck`、`npm run unit-check`、`npm run durability-check`、`node --import tsx test/operation-record-check.ts`、`node test/p2-regression.mjs`。最后一项使用构建出的 `../site/search/search_index.json`，覆盖本人隔离、真实 HTTP、同标识并发、服务重启、编辑、删除及操作记录保留。
