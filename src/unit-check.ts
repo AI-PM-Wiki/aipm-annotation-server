@@ -13,6 +13,7 @@
  *  3. 端到端语义(HTTP):三态可见性(私有对他人是 404 而不是 403)、归属校验、
  *     限流与预算、回退与降级、缓存复用。
  */
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +43,7 @@ import {
   filterForScope,
   mergeReplies,
   normalizeBody,
+  normalizeColor,
   normalizeSelectors,
   normalizeStyle,
   normalizeVisibility,
@@ -332,6 +334,11 @@ async function loginAs(
   return (await sessionRes.json()) as { token: string; user: Author };
 }
 
+const annotationPermitRequests = new WeakMap<
+  Harness,
+  Map<string, Promise<{ status: number; body: any; headers: Headers }>>
+>();
+
 async function api(
   h: Harness,
   path: string,
@@ -340,7 +347,76 @@ async function api(
   const headers = new Headers(init.headers);
   if (init.token !== undefined) headers.set('Authorization', `Bearer ${init.token}`);
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
-  const res = await fetch(`${h.base}${path}`, { ...init, headers, redirect: 'manual' });
+  let requestBody = init.body;
+  const method = (init.method ?? 'GET').toUpperCase();
+  if (new URL(path, h.base).pathname === '/api/annotations' && method === 'POST' &&
+      init.token !== undefined && typeof requestBody === 'string' && !headers.has('X-Annotation-Permit')) {
+    const payload = JSON.parse(requestBody) as Record<string, any>;
+    const target = typeof payload.target === 'object' && payload.target !== null
+      ? payload.target as Record<string, unknown> : {};
+    const author = h.auth.verify(init.token);
+    const requestIdIsValid = payload.requestId === undefined ||
+      (typeof payload.requestId === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(payload.requestId));
+    const validCreate = author !== null && requestIdIsValid &&
+      typeof payload.page === 'string' && canonicalPage(payload.page) !== null &&
+      normalizeBody(payload.body, h.config.maxBodyChars, true).ok &&
+      normalizeColor(payload.color).ok && normalizeStyle(payload.style).ok &&
+      normalizeVisibility(payload.visibility).ok &&
+      (target.scope === undefined || target.scope === 'page') &&
+      normalizeSelectors(target.selectors, { allowEmpty: target.scope === 'page' }).ok;
+    if (validCreate) {
+      if (payload.requestId === undefined) {
+        payload.requestId = randomUUID();
+        requestBody = JSON.stringify(payload);
+      }
+      const hasOriginalOperation = h.store.operations.some((operation) =>
+        operation.githubId === author.githubId && operation.requestId === payload.requestId);
+      if (!hasOriginalOperation) {
+        let requests = annotationPermitRequests.get(h);
+        if (requests === undefined) {
+          requests = new Map();
+          annotationPermitRequests.set(h, requests);
+        }
+        const key = `${author.githubId}:${payload.requestId}:${requestBody}`;
+        let permitRequest = requests.get(key);
+        if (permitRequest === undefined) {
+          permitRequest = (async () => {
+            const permitResponse = await fetch(`${h.base}/api/annotation-permits`, {
+              method: 'POST', headers, body: requestBody,
+            });
+            return { status: permitResponse.status, body: await permitResponse.json(),
+              headers: permitResponse.headers };
+          })();
+          requests.set(key, permitRequest);
+        }
+        const issued = await permitRequest;
+        if (issued.status !== 201) return issued;
+        const permitBody = issued.body as { permit?: string };
+        if (typeof permitBody.permit !== 'string' || permitBody.permit.length === 0) {
+          throw new Error('annotation permit missing from test fixture response');
+        }
+        headers.set('X-Annotation-Permit', permitBody.permit);
+      }
+    }
+  }
+  const replyPath = /^\/api\/annotations\/([^/]+)\/replies$/.exec(new URL(path, h.base).pathname);
+  if (replyPath !== null && method === 'POST' && init.token !== undefined &&
+      typeof requestBody === 'string' && !headers.has('X-Annotation-Permit')) {
+    const reply = JSON.parse(requestBody) as Record<string, unknown>;
+    const permitResponse = await fetch(`${h.base}/api/reply-permits`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ annotationId: decodeURIComponent(replyPath[1]!), ...reply }),
+    });
+    const permitBody = await permitResponse.json() as { permit?: string };
+    if (permitResponse.status !== 201) {
+      return { status: permitResponse.status, body: permitBody, headers: permitResponse.headers };
+    }
+    if (typeof permitBody.permit !== 'string' || permitBody.permit.length === 0) {
+      throw new Error('reply permit missing from test fixture response');
+    }
+    headers.set('X-Annotation-Permit', permitBody.permit);
+  }
+  const res = await fetch(`${h.base}${path}`, { ...init, body: requestBody, headers, redirect: 'manual' });
   const text = await res.text();
   let body: unknown = null;
   try {
