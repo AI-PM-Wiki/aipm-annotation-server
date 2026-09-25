@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, stat, utimes } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import { join, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { loadConfig } from '../src/config.ts';
 import { PageTextIndex } from '../src/index-store.ts';
 import { AuthService } from '../src/auth.ts';
@@ -39,17 +40,18 @@ await store.load();
 let auth = new AuthService(config, store);
 let server: Server;
 let base: string;
-async function start(): Promise<void> {
-  ({ server } = createApp({ config, store, auth, index, highlight }));
+async function start(permitTtlMs?: number): Promise<void> {
+  ({ server } = createApp({ config, store, auth, index, highlight, permitTtlMs }));
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 }
 async function stop(): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
-async function call(path: string, token?: string, method = 'GET', payload?: unknown) {
+async function call(path: string, token?: string, method = 'GET', payload?: unknown, permit?: string) {
   const response = await fetch(`${base}${path}`, { method,
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(permit ? { 'X-Annotation-Permit': permit } : {}),
       ...(payload ? { 'Content-Type': 'application/json' } : {}) },
     ...(payload ? { body: JSON.stringify(payload) } : {}) });
   return { status: response.status, body: await response.json() as Record<string, any> };
@@ -62,11 +64,26 @@ const requestId = 'same-user-request-2026';
 const url = `/api/annotation-requests/${requestId}`;
 const payload = { requestId, page: '/ai/rag/', body: 'operation body', color: 'yellow',
   visibility: 'private', target: { scope: 'page', selectors: [] } };
+async function permit(token: string, body: unknown = payload): Promise<string> {
+  const response = await call('/api/annotation-permits', token, 'POST', body);
+  assert.equal(response.status, 201);
+  return response.body.permit as string;
+}
 try {
   assert.equal((await call(url, alice)).status, 404);
   assert.equal((await call(url)).status, 401);
+  assert.equal((await call('/api/annotation-permits', undefined, 'POST', payload)).status, 401);
+  assert.equal((await call('/api/annotations', alice, 'POST', payload)).status, 403);
+  assert.equal(store.annotations.length, 0);
+  const alicePermit = await permit(alice);
+  assert.equal((await call('/api/annotations', bob, 'POST', payload, alicePermit)).status, 403);
+  assert.equal((await call('/api/annotations', alice, 'POST',
+    { ...payload, body: 'changed' }, alicePermit)).status, 403);
+  const otherSession = auth.issueSession({ githubId: 101, login: 'alice' });
+  assert.equal((await call('/api/annotations', otherSession, 'POST', payload, alicePermit)).status, 403);
+  assert.equal(store.annotations.length, 0);
   const results = await Promise.all(Array.from({ length: 4 }, () =>
-    call('/api/annotations', alice, 'POST', payload)));
+    call('/api/annotations', alice, 'POST', payload, alicePermit)));
   assert.deepEqual(results.map((item) => item.status).sort(), [200, 200, 200, 201]);
   const annotationId = results[0]!.body.annotation.id as string;
   assert(results.every((item) => item.body.annotation.id === annotationId));
@@ -75,7 +92,25 @@ try {
   assert.equal((await call(url, alice)).body.operation.annotationId, annotationId);
   assert.equal((await call(url, alice)).body.operation.status, 'succeeded');
   assert.equal((await call(url, alice)).body.operation.deleted, false);
-  const bobCreate = await call('/api/annotations', bob, 'POST', payload);
+  const replyPath = `/api/annotations/${annotationId}/replies`;
+  const reply = { body: 'reply body' };
+  assert.equal((await call(replyPath, bob, 'POST', reply)).status, 404);
+  assert.equal((await call(replyPath, alice, 'POST', reply)).status, 403);
+  assert.equal((await call('/api/reply-permits', bob, 'POST',
+    { annotationId, ...reply })).status, 404);
+  const replyPermitResponse = await call('/api/reply-permits', alice, 'POST',
+    { annotationId, ...reply });
+  assert.equal(replyPermitResponse.status, 201);
+  const replyPermit = replyPermitResponse.body.permit as string;
+  assert.equal((await call(replyPath, otherSession, 'POST', reply, replyPermit)).status, 403);
+  assert.equal((await call(replyPath, alice, 'POST', { body: 'tampered' }, replyPermit)).status, 403);
+  assert.equal((await call(replyPath, alice, 'POST', reply, replyPermit)).status, 201);
+  assert.equal((await call(replyPath, alice, 'POST', reply, replyPermit)).status, 403);
+  assert.equal((await call(`/api/annotations/${annotationId}`, alice, 'PATCH',
+    { replies: [{ body: 'bypass' }] })).status, 403);
+  assert.equal((await call('/api/annotations', alice, 'POST',
+    { ...payload, requestId: 'new-request-2026' }, alicePermit)).status, 403);
+  const bobCreate = await call('/api/annotations', bob, 'POST', payload, await permit(bob));
   assert.equal(bobCreate.status, 201);
   assert.notEqual(bobCreate.body.annotation.id, annotationId);
   assert.equal((await call(url, bob)).body.operation.annotationId, bobCreate.body.annotation.id);
@@ -108,6 +143,14 @@ try {
     annotationId);
   assert.equal(store.annotations.filter((item) => item.requestId === requestId).length, 1);
   assert.equal((await call('/api/annotation-requests/bad', alice)).status, 400);
+  await stop();
+  await start(50);
+  const expiring = { ...payload, requestId: 'expired-request-2026' };
+  const expiredPermit = await permit(alice, expiring);
+  await delay(100);
+  assert.equal((await call('/api/annotations', alice, 'POST', expiring, expiredPermit)).status, 403);
+  assert.equal((await call('/api/annotations', alice, 'POST', expiring,
+    await permit(alice, expiring))).status, 201);
   console.log('operation-record-check: HTTP / concurrency / restart / edit / delete / retention passed');
 } finally {
   await stop();

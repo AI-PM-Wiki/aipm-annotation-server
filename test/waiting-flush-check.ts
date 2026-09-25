@@ -60,8 +60,13 @@ try {
   const payload = JSON.stringify({ requestId: "review-request-waiting-flush", page: "/ai/rag/",
       body: "durability review", color: "yellow", visibility: "public",
       target: { selectors: [], scope: "page" } });
+  const permitResponse = await fetch(`${base}/api/annotation-permits`, { method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: payload });
+  assert.equal(permitResponse.status, 201);
+  const { permit } = await permitResponse.json() as { permit: string };
   const req = request(`${base}/api/annotations`, { method: "POST", headers: {
     Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+    "X-Annotation-Permit": permit,
     "Content-Length": Buffer.byteLength(payload), Expect: "100-continue"
   }});
   const responseReady = once(req, "response");

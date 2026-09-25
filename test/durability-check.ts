@@ -55,11 +55,16 @@ try {
       injected = true;
     }
   });
-  const pending = fetch(`${base}/api/annotations`, { method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ requestId: "review-request-partial-flush", page: "/ai/rag/",
+  const payload = JSON.stringify({ requestId: "review-request-partial-flush", page: "/ai/rag/",
       body: "durability review", color: "yellow", visibility: "public",
-      target: { selectors: [], scope: "page" } }) });
+      target: { selectors: [], scope: "page" } });
+  const permitResponse = await fetch(`${base}/api/annotation-permits`, { method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: payload });
+  assert.equal(permitResponse.status, 201);
+  const { permit } = await permitResponse.json() as { permit: string };
+  const pending = fetch(`${base}/api/annotations`, { method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+      "X-Annotation-Permit": permit }, body: payload });
   const deadline = Date.now() + 5000;
   while (store.annotations.length === 0) {
     assert(Date.now() < deadline, "annotation creation deadline");
