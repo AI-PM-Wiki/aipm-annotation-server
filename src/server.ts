@@ -630,11 +630,6 @@ export function createApp(deps: ServerDeps) {
       next.visibility = visibility.value;
     }
     if (parsed.data.replies !== undefined) {
-      if (parsed.data.replies.some((reply) => !reply.id ||
-          !record.replies.some((previous) => previous.id === reply.id))) {
-        sendError(req, res, 403, 'confirmation_required', '请使用回复确认入口新增评论', cors);
-        return;
-      }
       const merged = mergeReplies({
         existing: record.replies,
         incoming: parsed.data.replies as ReplyInput[],
@@ -646,6 +641,11 @@ export function createApp(deps: ServerDeps) {
       });
       if (!merged.ok) {
         sendError(req, res, merged.code === 'reply_forbidden' ? 403 : 400, merged.code, merged.detail, cors);
+        return;
+      }
+      if (parsed.data.replies.some((reply) => !reply.id ||
+          !record.replies.some((previous) => previous.id === reply.id))) {
+        sendError(req, res, 403, 'confirmation_required', '请使用回复确认入口新增评论', cors);
         return;
       }
       next.replies = merged.value;
