@@ -60,11 +60,13 @@ POST /api/auth/logout                           # 吊销会话
 
 ```
 GET    /api/annotations?page=<path>&scope=<public|mine>   # public 匿名可读;mine 需登录
-POST   /api/annotations                                   # 需登录;body.visibility: public|private
+POST   /api/annotation-permits                             # 需登录;完整创建请求与 requestId
+POST   /api/annotations                                   # 需登录 + 一次性许可;body.visibility: public|private
 GET    /api/annotations/:id                               # 无权读 → 404
 PATCH  /api/annotations/:id                               # 需登录 + 仅作者
 DELETE /api/annotations/:id                               # 需登录 + 仅作者(版主可删公开)
-POST   /api/annotations/:id/replies                       # 需登录 + 能读到即可;body:{body,parentId?}
+POST   /api/reply-permits                                  # 需登录 + 能读目标;body:{annotationId,body,parentId?}
+POST   /api/annotations/:id/replies                       # 需登录 + 一次性许可;body:{body,parentId?}
 DELETE /api/annotations/:id/replies/:replyId              # 回复作者,或批注作者
 PUT    /api/annotations/:id/like                          # 需登录;幂等
 DELETE /api/annotations/:id/like                          # 需登录;幂等
@@ -83,17 +85,13 @@ GET    /api/annotations/export?page=<path>                # hypothes.is JSON 兼
 
 ### 回复
 
-回复存在批注文档的 `replies` 数组里,但有**两条写入路径**,别混:
+回复存在批注文档的 `replies` 数组里。新增回复经 `POST /api/reply-permits` 取得许可，然后由同一会话携带 `X-Annotation-Permit` 请求 `POST /api/annotations/:id/replies`。
 
-- `POST /api/annotations/:id/replies` —— **普通回复走这条**。任何登录用户,只要能读到
-  这条批注,就能回。这是「回复」二字的定义:别人回你。
+- `POST /api/annotations/:id/replies` 允许有权限读取目标批注的登录用户发表回复，每次使用一份绑定目标与正文的许可。
 - `PATCH /api/annotations/:id` 的 `replies`(**整数组**语义)—— 仅批注作者,按
-  `mergeReplies` 的规则合并,是楼层楼主清理楼内回复的通道。自己的能改、批注作者能删、
-  别人的既改不动也删不掉(`reply_forbidden`)。
+  `mergeReplies` 的规则更新已有回复。回复作者可编辑自己的内容，批注作者可删除回复，新增标识须走独立的许可入口。
 
-早先只有 PATCH 这一条路,而 PATCH 是「仅作者」的 —— 结果是**别人根本回不了你的批注**。
-`POST` 那条就是为补这个洞加的;`DELETE .../replies/:replyId` 让回复作者与楼主各自能删
-自己该删的。
+`DELETE .../replies/:replyId` 允许回复作者与批注作者删除有权管理的回复。
 
 回复可以互相回复:新回复带 `parentId` 指向同一条批注下的另一条回复,父回复必须已存在
 (否则 `reply_not_found`)。**删父回复不级联删子回复** —— 别人在它下面的发言不该被连带
