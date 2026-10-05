@@ -6,6 +6,8 @@
  *   GET    /api/auth/github/start?return=     302 → GitHub 授权页
  *   GET    /api/auth/github/callback?code=&state=  换 token → 建会话 → 302 回站点
  *   POST   /api/auth/session                  {code} 一次性 code 换 bearer token
+ *   GET    /api/annotation-requests/:requestId  需本人会话，只读操作记录
+
  *   GET    /api/auth/me                       当前用户(未登录 401)
  *   POST   /api/auth/logout                   吊销会话
  *   POST   /api/auth/dev                      仅回环 + DEV_AUTH_BYPASS 时可用,直接发 token
@@ -28,12 +30,12 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { loadConfig } from './config.ts';
 import type { Config } from './config.ts';
 import { AnnotationStore } from './store.ts';
-import type { AnnotationRecord, Author } from './store.ts';
+import type { AnnotationRecord, Author, OperationRecord } from './store.ts';
 import { AuthService, sanitizeReturn } from './auth.ts';
 import { canonicalPage } from './index-store.ts';
 import type { IndexLike } from './index-store.ts';
@@ -65,6 +67,7 @@ import { HighlightService, normalizeJudgeBlocks, normalizePalette } from './high
 import type { HighlightRequest } from './highlight/index.ts';
 
 const CreateAnnotationSchema = z.object({
+  requestId: z.string().min(8).max(128).regex(/^[A-Za-z0-9_-]+$/).optional(),
   page: z.string().min(1).max(512),
   // 空正文合法:纯高亮没有文字(见 normalizeBody 的 allowEmpty)
   body: z.string().max(20_000),
@@ -120,6 +123,7 @@ interface ServerDeps {
   auth: AuthService;
   index: IndexLike;
   highlight: HighlightService;
+  permitTtlMs?: number;
 }
 
 export function createApp(deps: ServerDeps) {
@@ -128,6 +132,24 @@ export function createApp(deps: ServerDeps) {
   // 每账号写入配额:批注是写入型接口,按账号计比按 IP 准(同一 NAT 后的人不互相挤)
   const writeQuota = new SlidingWindowLimiter(config.writeQuotaMax, config.writeQuotaWindowMs);
   const startedAt = Date.now();
+  const permits = new Map<string, { kind: 'annotation' | 'reply'; githubId: number;
+    session: string; requestId: string;
+    payload: string; expiresAt: number }>();
+  const permitTtlMs = deps.permitTtlMs ?? 5 * 60 * 1000;
+  if (!Number.isSafeInteger(permitTtlMs) || permitTtlMs <= 0) {
+    throw new Error('invalid permit TTL');
+  }
+
+  function permitPayload(payload: unknown): string {
+    return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  }
+
+  function purgeExpiredPermits(): void {
+    const now = Date.now();
+    for (const [key, permit] of permits) {
+      if (permit.expiresAt <= now) permits.delete(key);
+    }
+  }
 
   function originAllowed(origin: string | undefined): boolean {
     if (origin === undefined) return true;
@@ -319,6 +341,42 @@ export function createApp(deps: ServerDeps) {
     return store.annotations.filter((a) => a.page === page);
   }
 
+  async function handleIssuePermit(
+    req: IncomingMessage, res: ServerResponse, cors: Record<string, string>,
+    actor: Author | null | 'rejected',
+  ): Promise<void> {
+    const user = requireLogin(req, res, cors, actor);
+    if (user === null) return;
+    const json = await readJson(req, res, cors);
+    if (json === null) return;
+    const parsed = CreateAnnotationSchema.safeParse(json);
+    if (!parsed.success || parsed.data.requestId === undefined ||
+        canonicalPage(parsed.data.page) === null ||
+        !normalizeVisibility(parsed.data.visibility).ok ||
+        !normalizeBody(parsed.data.body, config.maxBodyChars, true).ok ||
+        !normalizeColor(parsed.data.color).ok || !normalizeStyle(parsed.data.style).ok ||
+        !normalizeSelectors(parsed.data.target.selectors, {
+          allowEmpty: parsed.data.target.scope === 'page',
+        }).ok) {
+      sendError(req, res, 400, 'bad_request', '创建请求格式不正确', cors);
+      return;
+    }
+    if (store.operations.some((item) => item.githubId === user.githubId &&
+        item.requestId === parsed.data.requestId)) {
+      sendError(req, res, 409, 'request_conflict', '原请求已有结果，请只读查询', cors);
+      return;
+    }
+    const session = bearerToken(req);
+    if (session === null) throw new Error('authenticated session missing');
+    purgeExpiredPermits();
+    const permit = randomBytes(32).toString('base64url');
+    permits.set(permit, { kind: 'annotation', githubId: user.githubId,
+      session: createHash('sha256').update(session).digest('hex'),
+      requestId: parsed.data.requestId, payload: permitPayload(parsed.data),
+      expiresAt: Date.now() + permitTtlMs });
+    writeJson(res, 201, { permit, expiresAt: new Date(Date.now() + permitTtlMs).toISOString() }, cors);
+  }
+
   async function handleListAnnotations(
     req: IncomingMessage,
     res: ServerResponse,
@@ -350,7 +408,26 @@ export function createApp(deps: ServerDeps) {
     );
   }
 
+  let createQueue: Promise<void> = Promise.resolve();
+
   async function handleCreateAnnotation(
+    req: IncomingMessage,
+    res: ServerResponse,
+    cors: Record<string, string>,
+    actor: Author | null | 'rejected',
+  ): Promise<void> {
+    const previous = createQueue;
+    let release!: () => void;
+    createQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      await handleCreateAnnotationLocked(req, res, cors, actor);
+    } finally {
+      release();
+    }
+  }
+
+  async function handleCreateAnnotationLocked(
     req: IncomingMessage,
     res: ServerResponse,
     cors: Record<string, string>,
@@ -400,6 +477,46 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, selectors.code, selectors.detail, cors);
       return;
     }
+    const digest = createHash('sha256').update(JSON.stringify({
+      page, body: body.value, color: color.value, style: style.value,
+      visibility: visibility.value, scope: pageScope ?? null, selectors: selectors.value,
+    })).digest('hex');
+
+    const requestId = parsed.data.requestId;
+    if (requestId !== undefined) {
+      const pending = store.operations.find((item) =>
+        item.githubId === user.githubId && item.requestId === requestId);
+      if (pending !== undefined) {
+        if (store.getPersistedOperation(user.githubId, requestId) === undefined) await store.flush();
+        const operation = store.getPersistedOperation(user.githubId, requestId);
+        if (operation === undefined) throw new Error('operation missing from persisted snapshot');
+        if (operation.evidence !== 'original' || operation.digest !== digest) {
+          sendError(req, res, 409, 'request_conflict', '原创建请求无法核验或内容不一致', cors);
+          return;
+        }
+        const original = store.getPersistedAnnotation(operation.annotationId);
+        if (original === undefined) {
+          writeJson(res, 200, { operation: { status: 'succeeded',
+            annotationId: operation.annotationId, deleted: true } }, cors);
+        } else {
+          writeJson(res, 200, { annotation: toClientJson(original, user) }, cors);
+        }
+        return;
+      }
+    }
+    const permitToken = req.headers['x-annotation-permit'];
+    const session = bearerToken(req);
+    purgeExpiredPermits();
+    const permit = typeof permitToken === 'string' ? permits.get(permitToken) : undefined;
+    if (session === null || permit === undefined || permit.kind !== 'annotation' ||
+        requestId === undefined ||
+        permit.githubId !== user.githubId || permit.requestId !== requestId ||
+        !safeEqual(permit.session, createHash('sha256').update(session).digest('hex')) ||
+        !safeEqual(permit.payload, permitPayload(parsed.data))) {
+      sendError(req, res, 403, 'confirmation_required', '此创建请求需要一次性确认许可', cors);
+      return;
+    }
+    permits.delete(permitToken as string);
     if (store.annotations.length >= config.maxAnnotations) {
       sendError(req, res, 507, 'storage_full', '批注存储已达容量上限', cors);
       return;
@@ -419,6 +536,7 @@ export function createApp(deps: ServerDeps) {
     const now = new Date().toISOString();
     const record: AnnotationRecord = {
       id: newAnnotationId(),
+      requestId,
       page,
       visibility: visibility.value,
       color: color.value,
@@ -433,8 +551,21 @@ export function createApp(deps: ServerDeps) {
       createdAt: now,
       updatedAt: now,
     };
-    store.setAnnotations([...store.annotations, record]);
-    await store.flush();
+    const operation: OperationRecord | undefined = requestId === undefined ? undefined : {
+      githubId: user.githubId, requestId, annotationId: record.id, digest, evidence: 'original',
+      page, visibility: visibility.value, createdAt: now,
+    };
+    store.addAnnotationWithOperation(record, operation);
+    try {
+      await store.flush();
+      if (!store.hasPersistedAnnotation(record.id)) {
+        throw new Error('created annotation missing from persisted snapshot');
+      }
+    } catch {
+      store.removeAnnotationWithOperation(record.id, operation);
+      sendError(req, res, 503, 'storage_failed', '批注未能保存', cors);
+      return;
+    }
     writeJson(res, 201, { annotation: toClientJson(record, user) }, cors);
   }
 
@@ -512,6 +643,11 @@ export function createApp(deps: ServerDeps) {
         sendError(req, res, merged.code === 'reply_forbidden' ? 403 : 400, merged.code, merged.detail, cors);
         return;
       }
+      if (parsed.data.replies.some((reply) => !reply.id ||
+          !record.replies.some((previous) => previous.id === reply.id))) {
+        sendError(req, res, 403, 'confirmation_required', '请使用回复确认入口新增评论', cors);
+        return;
+      }
       next.replies = merged.value;
     }
     next.updatedAt = new Date().toISOString();
@@ -546,6 +682,19 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 400, 'bad_request', '请求体格式不正确', cors);
       return;
     }
+    const permitToken = req.headers['x-annotation-permit'];
+    const permit = typeof permitToken === 'string' ? permits.get(permitToken) : undefined;
+    const session = bearerToken(req);
+    purgeExpiredPermits();
+    if (session === null || permit === undefined || permit.kind !== 'reply' ||
+        permit.expiresAt <= Date.now() || permit.githubId !== user.githubId ||
+        permit.requestId !== id ||
+        !safeEqual(permit.session, createHash('sha256').update(session).digest('hex')) ||
+        !safeEqual(permit.payload, permitPayload(parsed.data))) {
+      sendError(req, res, 403, 'confirmation_required', '此回复需要一次性确认许可', cors);
+      return;
+    }
+    permits.delete(permitToken as string);
     const merged = appendReply({
       existing: record.replies,
       body: parsed.data.body,
@@ -763,11 +912,55 @@ export function createApp(deps: ServerDeps) {
         // 一个 status 0,排查时完全不指向这里
         headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS';
         // Authorization 与 X-API-Key 必须显式放行,否则跨源请求连预检都过不去
-        headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-API-Key';
+        headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-API-Key, X-Annotation-Permit';
         headers['Access-Control-Max-Age'] = '86400';
       }
       res.writeHead(204, headers);
       res.end();
+      return;
+    }
+
+    if (method === 'POST' && path === '/api/annotation-permits') {
+      if (!limiter.tryAcquire(hashIp(clientIp(req)))) {
+        sendError(req, res, 429, 'rate_limited', '请求过于频繁', cors);
+        return;
+      }
+      void handleIssuePermit(req, res, cors, authenticate(req, res, cors)).catch(fail);
+      return;
+    }
+
+    if (method === 'POST' && path === '/api/reply-permits') {
+      const actor = authenticate(req, res, cors);
+      const user = requireLogin(req, res, cors, actor);
+      if (user === null) return;
+      if (!limiter.tryAcquire(hashIp(clientIp(req)))) {
+        sendError(req, res, 429, 'rate_limited', '请求过于频繁', cors);
+        return;
+      }
+      void (async () => {
+        const json = await readJson(req, res, cors);
+        if (json === null) return;
+        const parsed = ReplyCreateSchema.extend({ annotationId: z.string().min(1) }).safeParse(json);
+        if (!parsed.success) {
+          sendError(req, res, 400, 'bad_request', '回复格式不正确', cors);
+          return;
+        }
+        const record = store.annotations.find((item) => item.id === parsed.data.annotationId);
+        if (record === undefined || !canRead(record, user)) {
+          sendError(req, res, 404, 'not_found', '批注不存在', cors);
+          return;
+        }
+        const session = bearerToken(req);
+        if (session === null) throw new Error('authenticated session missing');
+        purgeExpiredPermits();
+        const permit = randomBytes(32).toString('base64url');
+        permits.set(permit, { kind: 'reply', githubId: user.githubId,
+          session: createHash('sha256').update(session).digest('hex'),
+          requestId: parsed.data.annotationId, payload: permitPayload({
+            body: parsed.data.body, parentId: parsed.data.parentId,
+          }), expiresAt: Date.now() + permitTtlMs });
+        writeJson(res, 201, { permit, expiresAt: new Date(Date.now() + permitTtlMs).toISOString() }, cors);
+      })().catch(fail);
       return;
     }
 
@@ -926,6 +1119,38 @@ export function createApp(deps: ServerDeps) {
         return;
       }
     }
+
+    const operationMatch = /^\/api\/annotation-requests\/([^/]+)$/.exec(path);
+    if (operationMatch !== null && method === 'GET') {
+      const actor = authenticate(req, res, cors);
+      const user = requireLogin(req, res, cors, actor);
+      if (user === null) return;
+      const requestId = operationMatch[1]!;
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId)) {
+        sendError(req, res, 400, 'bad_request', '请求标识格式不正确', cors);
+        return;
+      }
+      const operation = store.getPersistedOperation(user.githubId, requestId);
+      if (operation === undefined) {
+        if (store.operations.some((item) => item.githubId === user.githubId &&
+            item.requestId === requestId)) {
+          writeJson(res, 200, { operation: { status: 'pending' } }, cors);
+        } else {
+          sendError(req, res, 404, 'not_found', '操作记录不存在', cors);
+        }
+        return;
+      }
+      writeJson(res, 200, { operation: {
+        status: 'succeeded', annotationId: operation.annotationId,
+        ...(operation.evidence === 'original'
+          ? { page: operation.page, visibility: operation.visibility }
+          : { originalRequestKnown: false }),
+        createdAt: operation.createdAt,
+        deleted: store.getPersistedAnnotation(operation.annotationId) === undefined,
+      } }, cors);
+      return;
+    }
+
 
     const annotationMatch = /^\/api\/annotations\/([^/]+)$/.exec(path);
     if (annotationMatch !== null) {

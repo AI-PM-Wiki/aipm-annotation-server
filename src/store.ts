@@ -58,6 +58,7 @@ export interface Reply {
 
 export interface AnnotationRecord {
   id: string;
+  requestId?: string;
   /** 站点路径,如 "/ai/rag/"。 */
   page: string;
   visibility: Visibility;
@@ -91,14 +92,26 @@ export interface SessionRecord {
   revoked: boolean;
 }
 
+export interface OperationRecord {
+  githubId: number;
+  requestId: string;
+  annotationId: string;
+  evidence: 'original' | 'legacy';
+  digest: string | null;
+  page: string;
+  visibility: Visibility | null;
+  createdAt: string;
+}
+
 /** 落盘结构。带 version 便于日后迁移。 */
 export interface StoredState {
   version: 1;
   annotations: AnnotationRecord[];
   sessions: SessionRecord[];
+  operations: OperationRecord[];
 }
 
-const EMPTY_STATE: StoredState = { version: 1, annotations: [], sessions: [] };
+const EMPTY_STATE: StoredState = { version: 1, annotations: [], sessions: [], operations: [] };
 
 /** 单条批注的点赞数上限。存储文件可能被手工编辑,解析时不设上限就是给自己挖坑。 */
 const MAX_LIKES = 50_000;
@@ -122,6 +135,7 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
   if (!isRecord(json)) throw new Error('存储文件顶层不是对象');
   const annotations: AnnotationRecord[] = [];
   const sessions: SessionRecord[] = [];
+  const operations: OperationRecord[] = [];
   let dropped = 0;
 
   const rawAnnotations = Array.isArray(json.annotations) ? json.annotations : [];
@@ -136,7 +150,49 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
     if (s === null) dropped++;
     else sessions.push(s);
   }
-  return { state: { version: 1, annotations, sessions }, dropped };
+  if (json.operations !== undefined && !Array.isArray(json.operations)) {
+    throw new Error('操作记录结构无效');
+  }
+  for (const item of (json.operations ?? []) as unknown[]) {
+    if (!isRecord(item) || typeof item.githubId !== 'number' ||
+        !Number.isSafeInteger(item.githubId) || typeof item.requestId !== 'string' ||
+        typeof item.annotationId !== 'string' || typeof item.page !== 'string' ||
+        typeof item.createdAt !== 'string' ||
+        (item.evidence !== undefined && item.evidence !== 'original' && item.evidence !== 'legacy') ||
+        (item.digest !== null && typeof item.digest !== 'string') ||
+        (item.visibility !== null && item.visibility !== 'public' && item.visibility !== 'private')) {
+      throw new Error('操作记录损坏');
+    }
+    if (operations.some((record) => record.githubId === item.githubId &&
+        record.requestId === item.requestId)) throw new Error('操作记录标识重复');
+    const evidence = item.evidence === 'original' ? 'original' : 'legacy';
+    if (evidence === 'original' && (typeof item.digest !== 'string' ||
+        (item.visibility !== 'public' && item.visibility !== 'private'))) {
+      throw new Error('操作记录损坏');
+    }
+    operations.push({ githubId: item.githubId, requestId: item.requestId,
+      annotationId: item.annotationId, evidence,
+      digest: evidence === 'original' ? item.digest as string : null,
+      page: item.page, visibility: evidence === 'original' ? item.visibility as Visibility : null,
+      createdAt: item.createdAt });
+  }
+
+  for (const annotation of annotations) {
+    if (annotation.requestId === undefined) continue;
+    const existing = operations.find((record) => record.githubId === annotation.author.githubId &&
+      record.requestId === annotation.requestId);
+    if (existing !== undefined) {
+      if (existing.annotationId !== annotation.id) throw new Error('操作记录标识重复');
+      continue;
+    }
+
+    operations.push({ githubId: annotation.author.githubId,
+      requestId: annotation.requestId, annotationId: annotation.id,
+      evidence: 'legacy', digest: null, page: annotation.page,
+      visibility: null, createdAt: annotation.createdAt });
+  }
+
+  return { state: { version: 1, annotations, sessions, operations }, dropped };
 }
 
 function parseAuthor(value: unknown): Author | null {
@@ -202,6 +258,7 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
   const now = new Date(0).toISOString();
   return {
     id,
+    requestId: typeof value.requestId === 'string' ? value.requestId : undefined,
     page,
     visibility,
     color: typeof color === 'string' && color.length > 0 ? color : 'yellow',
@@ -240,8 +297,10 @@ export class AnnotationStore {
   private readonly tmpPath: string;
   private state: StoredState = EMPTY_STATE;
   private writeChain: Promise<void> = Promise.resolve();
-  private dirty = false;
-  private flushing = false;
+  private revision = 0;
+  private persistedRevision = 0;
+  private inFlightRevision = 0;
+  private persistedState: StoredState = EMPTY_STATE;
   private lastWriteError: string | null = null;
 
   constructor(dataDir: string) {
@@ -257,6 +316,19 @@ export class AnnotationStore {
     return this.lastWriteError;
   }
 
+  getPersistedOperation(githubId: number, requestId: string): OperationRecord | undefined {
+    return this.persistedState.operations.find((item) =>
+      item.githubId === githubId && item.requestId === requestId);
+  }
+
+  getPersistedAnnotation(id: string): AnnotationRecord | undefined {
+    return this.persistedState.annotations.find((item) => item.id === id);
+  }
+
+  hasPersistedAnnotation(id: string): boolean {
+    return this.getPersistedAnnotation(id) !== undefined;
+  }
+
   /** 启动加载:文件不存在按空库起步(首次部署无需预置文件)。 */
   async load(): Promise<{ dropped: number; annotations: number; sessions: number }> {
     await mkdir(dirname(this.filePath), { recursive: true });
@@ -265,13 +337,15 @@ export class AnnotationStore {
       raw = await readFile(this.filePath, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        this.state = { version: 1, annotations: [], sessions: [] };
+        this.state = { version: 1, annotations: [], sessions: [], operations: [] };
+    this.persistedState = this.state;
         return { dropped: 0, annotations: 0, sessions: 0 };
       }
       throw err;
     }
     const { state, dropped } = parseState(raw);
     this.state = state;
+    this.persistedState = state;
     return { dropped, annotations: state.annotations.length, sessions: state.sessions.length };
   }
 
@@ -288,6 +362,24 @@ export class AnnotationStore {
     return this.state.sessions;
   }
 
+  get operations(): OperationRecord[] {
+    return this.state.operations;
+  }
+
+  addAnnotationWithOperation(annotation: AnnotationRecord, operation?: OperationRecord): void {
+    this.state = { ...this.state, annotations: [...this.state.annotations, annotation],
+      operations: operation === undefined ? this.state.operations : [...this.state.operations, operation] };
+    this.markDirty();
+  }
+
+  removeAnnotationWithOperation(annotationId: string, operation?: OperationRecord): void {
+    this.state = { ...this.state,
+      annotations: this.state.annotations.filter((item) => item.id !== annotationId),
+      operations: operation === undefined ? this.state.operations :
+        this.state.operations.filter((item) => item !== operation) };
+    this.markDirty();
+  }
+
   setAnnotations(annotations: AnnotationRecord[]): void {
     this.state = { ...this.state, annotations };
     this.markDirty();
@@ -299,42 +391,49 @@ export class AnnotationStore {
   }
 
   private markDirty(): void {
-    this.dirty = true;
+    this.revision++;
   }
 
-  /** 等待当前所有排队写入落盘(单测与优雅退出用)。 */
+  /** 每个调用者等待包含自己调用时状态的保存任务。 */
   async flush(): Promise<void> {
-    if (!this.dirty) {
-      await this.writeChain;
-      return;
-    }
-    if (this.flushing) {
-      await this.writeChain;
-      return;
-    }
-    this.flushing = true;
-    this.dirty = false;
-    const payload = JSON.stringify(this.state);
-    this.writeChain = this.writeChain.then(async () => {
-      try {
-        await writeFile(this.tmpPath, payload, 'utf8');
-        await rename(this.tmpPath, this.filePath); // 原子替换:读到的一半新一半旧不可能发生
-        this.lastWriteError = null;
-      } catch (err) {
-        this.lastWriteError = err instanceof Error ? err.message : 'unknown';
-        console.error(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            event: 'store_write_failed',
-            error: this.lastWriteError,
-          }),
-        );
-      } finally {
-        this.flushing = false;
-        // 落盘期间又有新修改:再冲一次
-        if (this.dirty) void this.flush();
+    const requiredRevision = this.revision;
+    while (this.persistedRevision < requiredRevision) {
+      if (this.inFlightRevision < requiredRevision) {
+        const revision = this.revision;
+        const payload = JSON.stringify(this.state);
+        const snapshot = this.state;
+        this.inFlightRevision = revision;
+        this.writeChain = this.writeChain.catch(() => {}).then(async () => {
+          try {
+            await writeFile(this.tmpPath, payload, 'utf8');
+            await rename(this.tmpPath, this.filePath);
+            this.persistedRevision = revision;
+            this.persistedState = snapshot;
+            this.lastWriteError = null;
+          } catch (err) {
+            this.lastWriteError = err instanceof Error ? err.message : 'unknown';
+            console.error(JSON.stringify({
+              ts: new Date().toISOString(),
+              event: 'store_write_failed',
+              error: this.lastWriteError,
+            }));
+            throw err;
+          } finally {
+            if (this.inFlightRevision === revision) this.inFlightRevision = 0;
+            if (this.persistedRevision === revision && this.revision > revision &&
+                this.inFlightRevision === 0) {
+              void this.flush().catch((err) => {
+                console.error('store_followup_write_failed', err);
+              });
+            }
+          }
+        });
       }
-    });
-    await this.writeChain;
+      try {
+        await this.writeChain;
+      } catch (err) {
+        if (this.persistedRevision < requiredRevision) throw err;
+      }
+    }
   }
 }

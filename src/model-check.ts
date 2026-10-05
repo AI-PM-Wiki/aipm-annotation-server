@@ -1,0 +1,236 @@
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { join, resolve } from 'node:path';
+import { test } from 'node:test';
+import { loadConfig } from './config.ts';
+import { PageTextIndex, normalizeIndexText } from './index-store.ts';
+import { HighlightService } from './highlight/index.ts';
+import type { SuggestBody } from './highlight/index.ts';
+import { JevJudge } from './highlight/jev-provider.ts';
+import { LlmJudge } from './highlight/llm-provider.ts';
+
+const group = process.argv[2] ?? 'all';
+assert(['all', 'llm', 'jev'].includes(group), 'expected all, llm or jev');
+const requirements = {
+  llm: ['AIPM_REAL_MODEL_API_KEY', 'AIPM_REAL_MODEL_BASE_URL', 'AIPM_REAL_MODEL_NAME'],
+  jev: ['AIPM_REAL_JEV_API_KEY', 'AIPM_REAL_JEV_BASE_URL', 'AIPM_REAL_JEV_MODEL'],
+};
+let pending = false;
+for (const provider of ['llm', 'jev'] as const) {
+  if (group !== 'all' && group !== provider) continue;
+  const missing = requirements[provider].filter(name => !process.env[name]);
+  if (missing.length) {
+    console.log(JSON.stringify({ provider, status: 'not_run', missing,
+      checks: ['provider response', 'usage cost', 'partial coverage', 'cache reuse', 'cache reload', 'refresh'] }));
+    pending = true;
+    continue;
+  }
+  const baseUrl = new URL(process.env[requirements[provider][1]!]!);
+  assert.equal(baseUrl.protocol, 'https:');
+  assert.equal(baseUrl.username, '');
+  assert.equal(baseUrl.password, '');
+  assert.equal(baseUrl.search, '');
+  assert.equal(baseUrl.hash, '');
+  await test(`authorized ${provider} provider and cache`, async t => {
+    const root = resolve('../meta/model-check');
+    await mkdir(root, { recursive: true });
+    const data = await mkdtemp(join(root, `${provider}-`));
+    const originalFetch = globalThis.fetch;
+    const exchanges: Array<{ request: Record<string, any>; response: Record<string, any>; status: number }> = [];
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).origin !== baseUrl.origin) return originalFetch(input, init);
+      const sent = await request.clone().json() as Record<string, any>;
+      const response = await originalFetch(input, init);
+      exchanges.push({ request: sent, response: await response.clone().json() as Record<string, any>, status: response.status });
+      return response;
+    };
+    t.after(async () => {
+      globalThis.fetch = originalFetch;
+      await writeFile(join(data, 'provider-exchanges.json'), JSON.stringify(exchanges, null, 2));
+    });
+    const search = await readFile('../site/search/search_index.json');
+    const staticServer = createServer((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(search);
+    });
+    await new Promise<void>(resolve => staticServer.listen(0, '127.0.0.1', resolve));
+    t.after(async () => {
+      await new Promise<void>((resolve, reject) => staticServer.close(error => error ? reject(error) : resolve()));
+    });
+    const config = loadConfig({ HOST: '127.0.0.1', DEV_AUTH_BYPASS: 'true', DATA_DIR: data,
+      SEARCH_INDEX_URL: `http://127.0.0.1:${(staticServer.address() as { port: number }).port}/search/search_index.json`,
+      HIGHLIGHT_JUDGE_PRIMARY: provider, HIGHLIGHT_JUDGE_FALLBACK: 'none',
+      HIGHLIGHT_RATE_LIMIT_MAX: '100', HIGHLIGHT_CACHE_TTL_MS: '600000', HIGHLIGHT_WORTH_THRESHOLD: '0',
+      ...(provider === 'llm' ? {
+        ANTHROPIC_API_KEY: process.env.AIPM_REAL_MODEL_API_KEY!,
+        ANTHROPIC_BASE_URL: baseUrl.href, HIGHLIGHT_MODEL: process.env.AIPM_REAL_MODEL_NAME!,
+      } : {
+        TYPESAFE_API_KEY: process.env.AIPM_REAL_JEV_API_KEY!,
+        TYPESAFE_BASE_URL: baseUrl.href, JEV_MODEL: process.env.AIPM_REAL_JEV_MODEL!,
+      }),
+    });
+    const index = new PageTextIndex(config.searchIndexUrl, config.indexRefreshMs);
+    await index.load();
+    t.after(() => index.stop());
+    const h = config.highlight;
+    const jev = new JevJudge({ apiKey: h.jevApiKey, baseUrl: h.jevBaseUrl, model: h.jevModel,
+      timeoutMs: h.jevTimeoutMs, inputCostPerMtok: h.jevInputCostPerMtok });
+    const llm = new LlmJudge({ apiKey: h.llmApiKey, model: h.llmModel, maxTokens: h.llmMaxTokens,
+      timeoutMs: h.llmTimeoutMs, baseUrl: h.llmBaseUrl, mode: h.llmMode,
+      inputCostPerMtok: h.llmInputCostPerMtok, outputCostPerMtok: h.llmOutputCostPerMtok });
+    const page = '/ai/rag/';
+    const source = normalizeIndexText(index.pageText(page));
+    assert(source.length > 400);
+    const blocks = [{ id: 'b1', text: source.slice(0, 200) }, { id: 'b2', text: source.slice(200, 400) }];
+    const palette = [{ id: 'yellow', label: '定义', when: '定义与术语' }];
+    const outcome = await (provider === 'llm' ? llm : jev).judge({ page, title: 'RAG', palette,
+      chunk: { index: 0, blocks }, totalChunks: 1 });
+    assert(outcome.suggestions.length > 0);
+    assert((outcome.usage?.inputTokens ?? 0) > 0);
+    assert((outcome.usage?.outputTokens ?? 0) > 0, 'billing check requires actual nonzero output usage');
+    const usage = outcome.usage!;
+    assert.equal(exchanges.length, 1, 'billing evidence requires one successful provider response');
+    const rawUsage = exchanges[0]!.response.usage;
+    assert.equal(exchanges[0]!.status, 200);
+    assert.equal(usage.inputTokens, rawUsage.input_tokens);
+    assert.equal(usage.outputTokens, rawUsage.output_tokens);
+    assert.equal(usage.costUsd, ((usage.inputTokens ?? 0) * (provider === 'llm'
+      ? h.llmInputCostPerMtok : h.jevInputCostPerMtok) +
+      (provider === 'llm' ? (usage.outputTokens ?? 0) * h.llmOutputCostPerMtok : 0)) / 1_000_000);
+    assert(outcome.suggestions.every(item => blocks.some(block => block.id === item.id)));
+    assert(outcome.suggestions.every(item => item.worth >= 0 && item.worth <= 1));
+    assert(outcome.suggestions.every(item => item.source === provider));
+    assert.equal(typeof outcome.model, 'string');
+    assert(outcome.model!.length > 0);
+    assert.equal(outcome.model, exchanges[0]!.response.model);
+    assert.equal(exchanges[0]!.request.model, provider === 'llm' ? h.llmModel : h.jevModel);
+    if (provider === 'llm') assert(outcome.suggestions.every(item => item.confidence === null));
+    await writeFile(join(data, 'provider-outcome.json'), JSON.stringify(outcome, null, 2));
+    const cachePath = join(data, 'highlight-cache.json');
+    const service = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    const calls = provider === 'llm' ? service.llmCalls : service.jevCalls;
+    const unusedCalls = provider === 'llm' ? service.jevCalls : service.llmCalls;
+    function assertConclusions(body: SuggestBody, ids: string[]) {
+      for (const id of ids) {
+        const suggestions = body.suggestions.filter(item => item.id === id);
+        const degraded = body.degraded.filter(item => item.id === id);
+        assert.equal(suggestions.length + degraded.length, 1, `one actual conclusion for ${id}`);
+        if (suggestions.length === 0) assert(degraded[0]!.reason.length > 0);
+      }
+      assert([...body.suggestions, ...body.degraded].every(item => ids.includes(item.id)));
+    }
+    const request = { page, title: 'RAG', palette, blocks, judge: 'auto' as const };
+    const partial = await service.suggest({ ...request, blocks: [blocks[0]!] }, 'model-review');
+    assert(partial.ok);
+    assert.equal(partial.body.cached, undefined);
+    assertConclusions(partial.body, [blocks[0]!.id]);
+    assert.equal(calls.usedCount, 1);
+    assert.equal(unusedCalls.usedCount, 0);
+    const partialCallCount = calls.usedCount;
+    const full = await service.suggest(request, 'model-review');
+    assert(full.ok);
+    assert.equal(full.body.cached, undefined);
+    assert.equal(full.body.judge, provider);
+    assert.equal(typeof full.body.model, 'string');
+    assert(full.body.model!.length > 0);
+    assert(full.body.suggestions.every(item => item.source === provider));
+    assert.equal(calls.usedCount, 2);
+    assert.equal(unusedCalls.usedCount, 0);
+    const fullCallCount = calls.usedCount;
+    assertConclusions(full.body, blocks.map(item => item.id));
+    assert(full.body.suggestions.length >= 2, 'sorting evidence requires multiple actual suggestions');
+    for (let i = 1; i < full.body.suggestions.length; i++) {
+      const previous: SuggestBody['suggestions'][number] = full.body.suggestions[i - 1]!;
+      const current: SuggestBody['suggestions'][number] = full.body.suggestions[i]!;
+      assert(previous.importance > current.importance ||
+        (previous.importance === current.importance && previous.worth >= current.worth));
+    }
+    const previousCalls = calls.usedCount;
+    const previousSpent = service.budget.spentUsd;
+    const repeated = await service.suggest(request, 'model-review');
+    assert(repeated.ok);
+    assert.equal(repeated.body.cached, true);
+    assert.deepEqual(repeated.body.suggestions, full.body.suggestions);
+    assert.equal(calls.usedCount, previousCalls);
+    assert.equal(unusedCalls.usedCount, 0);
+    assertConclusions(repeated.body, blocks.map(item => item.id));
+    assert.equal(service.budget.spentUsd, previousSpent);
+    await service.flushCache();
+    const initialDisk = JSON.parse(await readFile(cachePath, 'utf8'));
+    assert.equal(initialDisk.version, 1);
+    assert.equal(initialDisk.entries.length, 1);
+    assert.deepEqual([...initialDisk.entries[0].coverage].sort(), blocks.map(item => item.id).sort());
+    const restarted = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    assert.equal((await restarted.loadCache()).loaded, 1);
+    const restored = await restarted.suggest(request, 'model-review');
+    assert(restored.ok);
+    assert.equal(restored.body.cached, true);
+    assert.deepEqual(restored.body.suggestions, full.body.suggestions);
+    assert.equal(restarted.jevCalls.usedCount, 0);
+    assert.equal(restarted.llmCalls.usedCount, 0);
+    assert.equal(restarted.budget.spentUsd, 0);
+    const refreshed = await restarted.suggest({ ...request, refresh: true }, 'model-review');
+    assert(refreshed.ok);
+    assert.equal(refreshed.body.cached, undefined);
+    assert.equal((provider === 'llm' ? restarted.llmCalls : restarted.jevCalls).usedCount, 1);
+    assert.equal((provider === 'llm' ? restarted.jevCalls : restarted.llmCalls).usedCount, 0);
+    assertConclusions(refreshed.body, blocks.map(item => item.id));
+    await restarted.flushCache();
+    const persisted = JSON.parse(await readFile(cachePath, 'utf8')) as {
+      version: number; entries: Array<{ key: string; expiresAt: number; coverage?: string[]; body: unknown }>;
+    };
+    assert.equal(persisted.version, 1);
+    for (const entry of persisted.entries) delete entry.coverage;
+    await writeFile(cachePath, JSON.stringify(persisted));
+    const legacy = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    assert.equal((await legacy.loadCache()).loaded, 1);
+    const recalculated = await legacy.suggest(request, 'model-review');
+    assert(recalculated.ok);
+    assert.equal(recalculated.body.cached, undefined);
+    assert((provider === 'llm' ? legacy.llmCalls : legacy.jevCalls).usedCount > 0);
+    await legacy.flushCache();
+    await writeFile(cachePath, '{ invalid cache JSON');
+    const corrupted = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    assert.deepEqual(await corrupted.loadCache(), { loaded: 0, dropped: 0 });
+    const fresh = await corrupted.suggest({ ...request, blocks: [blocks[0]!,
+      { id: 'footer', text: '在 GitHub 上编辑此页，贡献者信息与版权说明。' }] }, 'model-review');
+    assert(fresh.ok);
+    assert.equal(fresh.body.cached, undefined);
+    assert(fresh.body.degraded.some(item => item.id === 'footer' && item.reason === 'not_in_page'));
+    assert(fresh.body.suggestions.every(item => item.id === blocks[0]!.id));
+    assert((provider === 'llm' ? corrupted.llmCalls : corrupted.jevCalls).usedCount > 0);
+    await corrupted.flushCache();
+    const limited = new HighlightService({ config: { ...config,
+      highlight: { ...h, maxSuggestionsPerPage: 1 } }, index, judges: { jev, llm },
+      cachePath: join(data, 'limited-cache.json') });
+    const limitedCalls = provider === 'llm' ? limited.llmCalls : limited.jevCalls;
+    const limitedPartial = await limited.suggest({ ...request, blocks: [blocks[0]!] }, 'coverage-review');
+    assert(limitedPartial.ok);
+    assert.equal(limitedCalls.usedCount, 1);
+    const limitedFull = await limited.suggest(request, 'coverage-review');
+    assert(limitedFull.ok);
+    assert.equal(limitedFull.body.cached, undefined);
+    assert.equal(limitedCalls.usedCount, 2);
+    assert.equal(limitedFull.body.suggestions.length, 1);
+    assertConclusions(limitedFull.body, blocks.map(item => item.id));
+    const omitted = blocks.find(block => !limitedFull.body.suggestions.some(item => item.id === block.id))!;
+    assert(limitedFull.body.degraded.some(item => item.id === omitted.id &&
+      ['over_page_limit', 'no_answer', 'not_worth'].includes(item.reason)));
+    const limitedRepeated = await limited.suggest(request, 'coverage-review');
+    assert(limitedRepeated.ok);
+    assert.equal(limitedRepeated.body.cached, true);
+    assert.deepEqual(limitedRepeated.body.suggestions, limitedFull.body.suggestions);
+    assert.deepEqual(limitedRepeated.body.degraded, limitedFull.body.degraded);
+    assert.equal(limitedCalls.usedCount, 2);
+    assert.equal((provider === 'llm' ? limited.jevCalls : limited.llmCalls).usedCount, 0);
+    await limited.flushCache();
+    await writeFile(join(data, 'billing-evidence.json'), JSON.stringify({ provider, rawUsage, usage,
+      inputRate: provider === 'llm' ? h.llmInputCostPerMtok : h.jevInputCostPerMtok,
+      outputRate: provider === 'llm' ? h.llmOutputCostPerMtok : 0,
+      partialCalls: partialCallCount, fullCalls: fullCallCount, repeatedCalls: calls.usedCount,
+      omittedConclusion: limitedFull.body.degraded.filter(item => item.id === omitted.id) }, null, 2));
+  });
+}
+if (pending) process.exitCode = 1;
