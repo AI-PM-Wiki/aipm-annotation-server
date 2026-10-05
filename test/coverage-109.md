@@ -27,7 +27,8 @@ Statuses apply to the whole original assertion block:
 - `covered`: the listed local tests or durability scripts verify its behavior
   through production functions, real local HTTP and real storage.
 - `missing_configuration`: explicit real-provider or OAuth checks exist and await
-  authorized configuration. Their results remain unverified.
+  authorized configuration. `acceptance: "not_run"` records their unverified
+  execution status; `assertions` identifies the required checks.
 - `missing_check`: at least one assertion has no equivalent check. Existing
   partial evidence remains listed. Missing checks stay visible even when they
   would also require external configuration.
@@ -40,5 +41,15 @@ authorized controlled endpoint or user confirmation of the requested exception.
 
 Cache loading tests use actual files and production rule output. The real-model
 group obtains provider results from the authorized endpoint before testing cache
-reuse, restart, legacy coverage and corruption. UTC boundary checks and generated
-same-submission parent references remain explicitly unverified.
+reuse, restart, legacy coverage and corruption. Billing evidence retains the
+actual provider response and requires nonzero input and output usage. Every
+judged block needs a suggestion or a degraded conclusion. Sorting needs multiple
+actual suggestions. Cache files must have version 1, and repeated requests must
+leave provider call counts unchanged.
+
+The local reply merge check allocates actual UUIDs through `newId` and verifies
+parent references, identity and order within one submission. The restart retry
+check causes a real file write failure, removes the file obstruction, starts a
+new process and retries the same request with a newly issued permit. It verifies
+one persisted annotation and one operation. UTC boundary checks remain unverified
+pending separate time-source authorization.

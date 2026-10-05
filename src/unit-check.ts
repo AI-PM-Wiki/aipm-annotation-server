@@ -302,7 +302,11 @@ await test('budget, counters, rate limit and concurrency', async () => {
   assert(budget.tryReserve(0.7));
   budget.release(0.7);
   assert.equal(budget.reservedUsd, 0);
-  assert(new DailyBudget(0).tryReserve(999));
+  const unlimitedBudget = new DailyBudget(0);
+  assert(unlimitedBudget.tryReserve(999));
+  assert.equal(unlimitedBudget.remainingUsd, Infinity);
+  const unlimitedCounter = new DailyCounter(0);
+  for (let i = 0; i < 100; i++) assert(unlimitedCounter.tryAcquire());
   const counter = new DailyCounter(2);
   assert(counter.tryAcquire());
   assert(counter.tryAcquire());
@@ -366,6 +370,18 @@ await test('reply merge preserves ownership, order, limits and parent references
     incoming: [{ id: child.id, body: 'child', parentId: 'r1' }, { body: 'grandchild', parentId: child.id }] });
   assert(second.ok);
   assert(second.value.some(item => item.parentId === child.id));
+  const generatedIds = [randomUUID(), randomUUID()];
+  let allocated = 0;
+  const sameSubmission = mergeReplies({ ...options, actor: bob, isAnnotationOwner: false,
+    incoming: [{ body: 'new parent', parentId: 'r1' },
+      { body: 'new child', parentId: generatedIds[0]! }],
+    newId: () => generatedIds[allocated++]! });
+  assert(sameSubmission.ok);
+  assert.equal(allocated, 2);
+  assert.deepEqual(sameSubmission.value.map(item => item.id), [...generatedIds, 'r1']);
+  assert.deepEqual(sameSubmission.value.slice(0, 2).map(item => item.parentId), ['r1', generatedIds[0]]);
+  assert(sameSubmission.value.slice(0, 2).every(item => item.author.githubId === bob.githubId));
+  assert.deepEqual(sameSubmission.value.slice(0, 2).map(item => item.body), ['new parent', 'new child']);
   const missing = mergeReplies({ ...options, incoming: [{ body: 'child', parentId: 'missing' }] });
   assert(!missing.ok);
   assert.equal(missing.code, 'reply_not_found');
@@ -487,16 +503,21 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
     assert.deepEqual(writes.map(item => item.status).sort(), [200, 200, 200, 201]);
     const id = writes[0]!.body.annotation.id;
     assert(writes.every(item => item.body.annotation.id === id));
+    assert(writes.every(item => !('requestId' in item.body.annotation)));
     assert.equal(store.annotations.length, 1);
     assert.equal((await call(`/api/annotations/${id}`, bobToken)).status, 404);
     assert.equal((await call(`/api/annotations/${id}`)).status, 404);
-    assert.equal((await call(`/api/annotations/${id}`, aliceToken)).status, 200);
+    const read = await call(`/api/annotations/${id}`, aliceToken);
+    assert.equal(read.status, 200);
+    assert(!('requestId' in read.body.annotation));
     assert.equal((await call(`/api/annotations/${id}`, bobToken, 'PATCH', { body: 'overwrite' })).status, 404);
     assert.equal((await call(`/api/annotations/${id}`, bobToken, 'DELETE')).status, 404);
     assert.equal((await call(`/api/annotations/${id}/replies`, bobToken, 'POST', { body: 'reply' })).status, 404);
     assert.equal((await call('/api/annotations?page=/ai/rag/&scope=public')).body.annotations.length, 0);
     assert.equal((await call('/api/annotations?page=/ai/rag/&scope=mine', bobToken)).body.annotations.length, 0);
-    assert.equal((await call('/api/annotations?page=/ai/rag/&scope=mine', aliceToken)).body.annotations.length, 1);
+    const mine = await call('/api/annotations?page=/ai/rag/&scope=mine', aliceToken);
+    assert.equal(mine.body.annotations.length, 1);
+    assert(mine.body.annotations.every((item: Record<string, unknown>) => !('requestId' in item)));
     assert.equal((await call(`/api/annotation-requests/${payload.requestId}`, bobToken)).status, 404);
     assert.equal((await call(`/api/annotation-requests/${payload.requestId}`)).status, 401);
     const operation = await call(`/api/annotation-requests/${payload.requestId}`, aliceToken);
@@ -509,8 +530,12 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
       { ...payload, requestId: randomUUID(), page: 'https://evil.com/page/' })).status, 400);
     assert.equal((await call('/api/annotation-permits', aliceToken, 'POST',
       { ...payload, requestId: randomUUID(), target: { selectors: [{ type: 'TextQuoteSelector', exact: '' }] } })).status, 400);
-    assert.equal((await call('/api/annotation-permits', aliceToken, 'POST',
-      { ...payload, requestId: randomUUID(), visibility: 'local' })).status, 400);
+    const local = { ...payload, requestId: randomUUID(), visibility: 'local' };
+    for (const path of ['/api/annotation-permits', '/api/annotations']) {
+      const rejected = await call(path, aliceToken, 'POST', local);
+      assert.equal(rejected.status, 400);
+      assert.equal(rejected.body.error, path === '/api/annotations' ? 'invalid_visibility' : 'bad_request');
+    }
     for (const invalid of [
       { ...payload, requestId: randomUUID(), page: 'https://evil.com/page/' },
       { ...payload, requestId: randomUUID(), target: { selectors: [{ type: 'TextQuoteSelector', exact: '' }] } },
@@ -535,10 +560,18 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
     assert.equal(created.body.annotation.style, 'both');
     assert.equal(created.body.annotation.target.scope, 'page');
     assert.deepEqual(created.body.annotation.target.selectors, []);
-    assert.equal((await call(`/api/annotations/${id}`)).status, 200);
+    assert(!('requestId' in created.body.annotation));
+    const repeated = await call('/api/annotations', aliceToken, 'POST', publicPayload, permit.body.permit);
+    assert.equal(repeated.status, 200);
+    assert.equal(repeated.body.annotation.id, id);
+    assert(!('requestId' in repeated.body.annotation));
+    const read = await call(`/api/annotations/${id}`);
+    assert.equal(read.status, 200);
+    assert(!('requestId' in read.body.annotation));
     const anonymousList = await call('/api/annotations?page=/ai/rag/&scope=public');
     assert.equal(anonymousList.status, 200);
     assert.deepEqual(anonymousList.body.annotations.map((item: any) => item.id), [id]);
+    assert(anonymousList.body.annotations.every((item: Record<string, unknown>) => !('requestId' in item)));
     assert.equal((await call('/api/annotations?page=/ai/rag/&scope=mine', bobToken)).body.annotations.length, 0);
     assert.equal((await call('/api/annotations?page=/ai/rag/&scope=mine', aliceToken)).body.annotations.length, 2);
     assert.equal((await call(`/api/annotations/${id}`, bobToken, 'PATCH', { body: 'overwrite' })).status, 403);
@@ -588,6 +621,18 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
   await t.test('reply permits bind identity, session and content', async () => {
     const id = store.annotations.find(item => item.visibility === 'public')!.id;
     const reply = { body: 'reply from bob' };
+    for (const [path, input] of [['/api/reply-permits', { annotationId: id, ...reply }],
+      [`/api/annotations/${id}/replies`, reply]] as const) {
+      const anonymous = await call(path, undefined, 'POST', input);
+      assert.equal(anonymous.status, 401);
+      assert.equal(anonymous.body.error, 'login_required');
+    }
+    const missingParent = { body: 'missing parent', parentId: randomUUID() };
+    const missingPermit = await call('/api/reply-permits', bobToken, 'POST', { annotationId: id, ...missingParent });
+    assert.equal(missingPermit.status, 201);
+    const missing = await call(`/api/annotations/${id}/replies`, bobToken, 'POST', missingParent, missingPermit.body.permit);
+    assert.equal(missing.status, 400);
+    assert.equal(missing.body.error, 'reply_not_found');
     const permit = await call('/api/reply-permits', bobToken, 'POST', { annotationId: id, ...reply });
     assert.equal(permit.status, 201);
     assert.equal((await call(`/api/annotations/${id}/replies`, aliceToken, 'POST', reply, permit.body.permit)).status, 403);
@@ -606,7 +651,18 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
     assert.equal(added.body.annotation.replies[1].parentId, replies[0]!.id);
     const thirdToken = auth.issueSession({ githubId: 99, login: 'charlie' });
     assert.equal((await call(`/api/annotations/${id}/replies/${replies[0]!.id}`, thirdToken, 'DELETE')).status, 403);
-    assert.equal((await call(`/api/annotations/${id}/replies/${replies[0]!.id}`, bobToken, 'DELETE')).status, 200);
+    const ownerDeleted = await call(`/api/annotations/${id}/replies/${added.body.annotation.replies[1].id}`, bobToken, 'DELETE');
+    assert.equal(ownerDeleted.status, 403);
+    assert.equal(ownerDeleted.body.error, 'reply_forbidden');
+    const ownerRemoval = await call(`/api/annotations/${id}/replies/${replies[0]!.id}`, aliceToken, 'DELETE');
+    assert.equal(ownerRemoval.status, 200);
+    const selfReply = { body: 'bob deletes his own reply' };
+    const selfPermit = await call('/api/reply-permits', bobToken, 'POST', { annotationId: id, ...selfReply });
+    assert.equal(selfPermit.status, 201);
+    const selfCreated = await call(`/api/annotations/${id}/replies`, bobToken, 'POST', selfReply, selfPermit.body.permit);
+    assert.equal(selfCreated.status, 201);
+    const selfId = selfCreated.body.annotation.replies.find((item: { body: string }) => item.body === selfReply.body).id;
+    assert.equal((await call(`/api/annotations/${id}/replies/${selfId}`, bobToken, 'DELETE')).status, 200);
     const remaining = (await call(`/api/annotations/${id}`, aliceToken)).body.annotation.replies;
     assert.equal(remaining.length, 1);
     assert.equal(remaining[0].parentId, replies[0]!.id);
@@ -628,6 +684,7 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
     assert.equal(foreign.headers.get('access-control-allow-origin'), null);
     const returnOutside = await fetch(base + '/api/auth/github/start?return=https://evil.com/x', { redirect: 'manual' });
     assert.equal(returnOutside.status, 400);
+    assert.equal((await returnOutside.json() as { error: string }).error, 'invalid_return');
     const dev = await fetch(base + '/api/auth/dev', { method: 'POST', headers: { Origin: 'https://aipm.ac' } });
     assert.equal(dev.status, 200);
     assert.equal(dev.headers.get('access-control-allow-origin'), 'https://aipm.ac');
@@ -648,6 +705,12 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
     assert.equal((await call(`/api/annotations/${publicRecord.id}`)).status, 404);
   });
   await t.test('HTTP style round trips preserve each style and the omitted default', async () => {
+    const invalid = { ...payload, requestId: randomUUID(), style: 'wavy' };
+    for (const path of ['/api/annotation-permits', '/api/annotations']) {
+      const rejected = await call(path, aliceToken, 'POST', invalid);
+      assert.equal(rejected.status, 400);
+      assert.equal(rejected.body.error, path === '/api/annotations' ? 'invalid_style' : 'bad_request');
+    }
     for (const style of ['underline', 'highlight', 'both', undefined]) {
       const input = { ...payload, requestId: randomUUID(), visibility: 'public', body: 'style review',
         ...(style === undefined ? {} : { style }) };
@@ -665,6 +728,9 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
     }
   });
   await t.test('OAuth state failures and session revocation', async () => {
+    const anonymous = await call('/api/auth/me');
+    assert.equal(anonymous.status, 401);
+    assert.equal(anonymous.body.error, 'login_required');
     assert.equal((await call('/api/auth/session', undefined, 'POST', { code: 'unissued' })).status, 400);
     const callback = await fetch(base + '/api/auth/github/callback?code=unissued&state=unissued', { redirect: 'manual' });
     assert.equal(callback.status, 400);
@@ -718,14 +784,19 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
   await t.test('highlight HTTP rejects invalid page, foreign text and request limits before providers', async () => {
     const source = normalizeIndexText(index.pageText(page));
     const baseRequest = { page, palette, blocks: [{ id: 'b1', text: source.slice(0, 120) }] };
-    for (const invalid of [
-      { ...baseRequest, page: 'https://evil.com/x/' },
-      { ...baseRequest, page: '/not-indexed-review/' },
-      { ...baseRequest, blocks: [{ id: 'b1', text: '文本不属于站内正文，不能作为模型调用输入。' }] },
-      { ...baseRequest, blocks: Array.from({ length: 3 }, (_, i) => ({ id: `b${i}`, text: source.slice(0, 100) })) },
-      { ...baseRequest, blocks: [{ id: 'b1', text: source.slice(0, 301) }] },
-    ]) {
-      assert.equal((await call('/api/highlight/suggest', undefined, 'POST', invalid)).status, 400);
+    for (const [invalid, code] of [
+      [{ ...baseRequest, page: 'https://evil.com/x/' }, 'invalid_page'],
+      [{ ...baseRequest, page: '/not-indexed-review/' }, 'page_not_indexed'],
+      [{ ...baseRequest, blocks: [{ id: 'b1', text: '文本不属于站内正文，不能作为模型调用输入。' }] }, 'blocks_not_in_page'],
+      [{ ...baseRequest, blocks: Array.from({ length: 3 }, (_, i) => ({ id: `b${i}`, text: source.slice(0, 100) })) }, 'too_many_blocks'],
+      [{ ...baseRequest, blocks: [{ id: 'b1', text: source.slice(0, 301) }] }, 'too_many_chars'],
+    ] as const) {
+      const rejected = await call('/api/highlight/suggest', undefined, 'POST', invalid);
+      assert.equal(rejected.status, 400);
+      assert.equal(rejected.body.error, code);
+      assert.equal(highlight.jevCalls.usedCount, 0);
+      assert.equal(highlight.llmCalls.usedCount, 0);
+      assert.equal(highlight.budget.spentUsd, 0);
     }
     const short = source.slice(0, 1);
     const ruled = await call('/api/highlight/suggest', undefined, 'POST',

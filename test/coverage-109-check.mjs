@@ -49,7 +49,10 @@ const records = manifest.items.map((item, i) => {
   assert(Object.hasOwn(counts, item.status), `invalid coverage status: ${item.line}`);
   if (item.status === 'covered') assert(item.evidence.length > 0);
   if (item.status === 'missing_check') assert(item.remaining);
-  if (item.status === 'missing_configuration') assert(item.configuration);
+  if (item.status === 'missing_configuration') {
+    assert(item.configuration);
+    assert.equal(item.acceptance, 'not_run');
+  }
   for (const id of item.evidence) assert(Object.hasOwn(manifest.evidence, id), `unknown evidence: ${id}`);
   counts[item.status]++;
   const original = old.find(entry => entry.name === all[i].name);
