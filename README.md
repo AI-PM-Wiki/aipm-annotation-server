@@ -183,15 +183,28 @@ confidence 回退。这条是 2026-09-22 按实测改的:原先「本片建议�
 ```bash
 npm install
 npm run typecheck     # 类型检查
-npm run unit-check    # 单元检查(109 项;外部依赖全部注入 fake,不联网)
+npm run unit-check    # 纯函数与本地 HTTP 权限检查
+npm run durability-check
+npm run model-check -- llm
+npm run model-check -- jev
 npm run build         # 产出 dist/
 npm run dev           # tsx 直跑,读 .env
 ```
 
-`unit-check` 覆盖纯函数(分块、规则、索引抽样、回复合并、return 白名单、预算跨日)、
-两个 provider 的适配与降级、以及端到端 HTTP 语义(三态可见性、归属 401/403/404、
-限流与预算、回退与缓存(含落盘后重启复用、覆盖面校验与旧记录兼容)、重新生成的两条
-拒绝路径与缓存覆盖、LLM 兜底的两种线上格式(结构化输出 / 抠 JSON))。当前 109 项。
+`unit-check` 使用 Node.js 内置测试框架，覆盖配置、正文校验、回复归属、隐私导出、
+分块与规则、响应归一化、预算、限流和真实 HTTP 许可。索引来自主仓库构建产物
+`../site/search/search_index.json`，数据保存在主仓库忽略的 `meta/unit-check/` 中。
+HTTP 权限检查通过服务自身的会话签发功能建立本地会话。
+
+`durability-check` 验证持久化、并发、重启与操作记录。`model-check` 使用明确授权的
+HTTPS 服务检查实际模型响应、token 计费和缓存覆盖、重复读取、重启及重新生成。
+LLM 组要求 `AIPM_REAL_MODEL_API_KEY`、`AIPM_REAL_MODEL_BASE_URL`、
+`AIPM_REAL_MODEL_NAME`；Jev 组要求 `AIPM_REAL_JEV_API_KEY`、
+`AIPM_REAL_JEV_BASE_URL`、`AIPM_REAL_JEV_MODEL`。缺少配置的项目记录为
+`not_run`，命令返回非零退出码。
+
+实际模型限流、形状失败、低置信度、provider 切换和 GitHub OAuth 往返需独立的
+真实请求验收。主仓库 `test/browser/run.py --group oauth` 提供 OAuth 浏览器检查。
 
 ## 配置
 
