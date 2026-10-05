@@ -112,7 +112,33 @@ interface ChunkOutcome {
 
 interface CacheEntry {
   expiresAt: number;
+  /**
+   * 这一份结果判过哪些块:写入时,这次请求实际送进判分流程的那些块 id
+   * (抽样校验通过的),不从 suggestions 反推 —— 判过而没结论的块(值得高亮的
+   * 门槛没过、规则跳过)同样在覆盖面内。null = 无从判断,这份改动之前写下的
+   * 记录没有这一项。
+   *
+   * 为什么要它:缓存键只有页面粒度(页面 + 正文哈希 + judge + 色板),不含
+   * 「这一次送了哪些块」。旧前端会把已经划过线的块从请求里去掉,写出的一份于是
+   * 只是整页的子集,而它会被后来的整页请求当整页结果摆出去 —— 没送过的那几段
+   * 从此没有结论,既不划线也不进「未判定」。
+   */
+  coverage: Set<string> | null;
   body: SuggestBody;
+}
+
+/** `wanted` 是否被 `coverage` 完整盖住(判过的块覆盖这次要的块)。 */
+function covers(coverage: Set<string>, wanted: Set<string>): boolean {
+  for (const id of wanted) {
+    if (!coverage.has(id)) return false;
+  }
+  return true;
+}
+
+/** 读回存盘的覆盖面。旧记录没有这一项,形状不对的也一并当未知。 */
+function parseCoverage(raw: unknown): Set<string> | null {
+  if (!Array.isArray(raw) || !raw.every((id) => typeof id === 'string')) return null;
+  return new Set<string>(raw);
 }
 
 /** 校验失败的原因,与 HTTP 400 一一对应。 */
@@ -232,6 +258,10 @@ export class HighlightService {
       this.cache.delete(key);
       return null;
     }
+    /* 先校验覆盖面:这一格只答得了它判过的那些块。请求里有一块不在覆盖面内
+       (旧前端送过子集,如今整页来了),或者这一份根本没记覆盖面(旧版本写下的
+       记录),都按未命中处理 —— 重新判一轮整页,判完覆盖这一格。 */
+    if (entry.coverage === null || !covers(entry.coverage, wanted)) return null;
     /* 命中但要按本次请求的块集合过滤:缓存是同页的整页结果,请求可能只要其中一部分。
        degraded 同样要过滤 —— 它是「这一页哪些块没给建议」的逐块记录,掺进本次没发
        的块,面板上的「N 段未判定」就会数到用户根本没送出去的段落。 */
@@ -241,7 +271,11 @@ export class HighlightService {
     return { ...entry.body, suggestions, degraded, cached: true };
   }
 
-  private writeCache(key: string, body: SuggestBody): void {
+  /**
+   * `coverage` 传这一轮实际判过的块(抽样校验通过的那些) —— 读的时候据此判断
+   * 这一格答不答得了某次请求。判分失败那条路不会走到这里,旧缓存原样留着。
+   */
+  private writeCache(key: string, coverage: Set<string>, body: SuggestBody): void {
     const h = this.config.highlight;
     if (h.cacheTtlMs <= 0 || h.cacheMaxEntries <= 0) return;
     if (this.cache.size >= h.cacheMaxEntries) {
@@ -249,7 +283,11 @@ export class HighlightService {
       const oldest = this.cache.keys().next();
       if (!oldest.done) this.cache.delete(oldest.value);
     }
-    this.cache.set(key, { expiresAt: this.now() + h.cacheTtlMs, body: { ...body, cached: undefined } });
+    this.cache.set(key, {
+      expiresAt: this.now() + h.cacheTtlMs,
+      coverage,
+      body: { ...body, cached: undefined },
+    });
     this.scheduleCacheSave();
   }
 
@@ -279,7 +317,12 @@ export class HighlightService {
       return { loaded: 0, dropped: 0 };
     }
     let dropped = 0;
-    let entries: Array<{ key: string; expiresAt: number; body: SuggestBody }> = [];
+    let entries: Array<{
+      key: string;
+      expiresAt: number;
+      coverage: Set<string> | null;
+      body: SuggestBody;
+    }> = [];
     try {
       const parsed: unknown = JSON.parse(raw);
       const list = isRecord(parsed) && Array.isArray(parsed.entries) ? parsed.entries : [];
@@ -299,6 +342,9 @@ export class HighlightService {
         entries.push({
           key: item.key,
           expiresAt: item.expiresAt,
+          /* 旧记录没有覆盖面:照常加载(它只是一份缓存,不该挡启动),读的时候
+             按未命中处理 —— 不知道判过哪些块的一份,答不了任何一次请求。 */
+          coverage: parseCoverage(item.coverage),
           body: {
             ...(item.body as unknown as SuggestBody),
             degraded: Array.isArray(item.body.degraded) ? (item.body.degraded as DegradedBlock[]) : [],
@@ -311,7 +357,9 @@ export class HighlightService {
     }
     entries.sort((a, b) => a.expiresAt - b.expiresAt);
     if (entries.length > h.cacheMaxEntries) entries = entries.slice(entries.length - h.cacheMaxEntries);
-    for (const e of entries) this.cache.set(e.key, { expiresAt: e.expiresAt, body: e.body });
+    for (const e of entries) {
+      this.cache.set(e.key, { expiresAt: e.expiresAt, coverage: e.coverage, body: e.body });
+    }
     return { loaded: entries.length, dropped };
   }
 
@@ -336,6 +384,7 @@ export class HighlightService {
     const entries = [...this.cache.entries()].map(([key, entry]) => ({
       key,
       expiresAt: entry.expiresAt,
+      coverage: entry.coverage === null ? null : [...entry.coverage],
       body: entry.body,
     }));
     const payload = JSON.stringify({ version: 1, entries });
@@ -794,7 +843,10 @@ export class HighlightService {
         usage.costUsd = Number(requestCostUsd.toFixed(6));
         body.usage = usage;
       }
-      this.writeCache(key, body);
+      /* 覆盖面 = 这一轮判过的块:校验通过的这些全部进了判分流程(规则跳过的、
+         值得高亮的门槛没过的,在 degraded 里各有一条结论),这一格答得了的正是
+         它们。判分失败的那几条路不会走到这里,旧缓存原样留着。 */
+      this.writeCache(key, wanted, body);
       return { ok: true, body };
     } finally {
       release?.();
