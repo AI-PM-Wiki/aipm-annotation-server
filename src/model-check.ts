@@ -80,6 +80,9 @@ for (const provider of ['llm', 'jev'] as const) {
       (provider === 'llm' ? (usage.outputTokens ?? 0) * h.llmOutputCostPerMtok : 0)) / 1_000_000);
     assert(outcome.suggestions.every(item => blocks.some(block => block.id === item.id)));
     assert(outcome.suggestions.every(item => item.worth >= 0 && item.worth <= 1));
+    assert(outcome.suggestions.every(item => item.source === provider));
+    assert.equal(typeof outcome.model, 'string');
+    assert(outcome.model!.length > 0);
     if (provider === 'llm') assert(outcome.suggestions.every(item => item.confidence === null));
     await writeFile(join(data, 'provider-outcome.json'), JSON.stringify(outcome, null, 2));
     const cachePath = join(data, 'highlight-cache.json');
@@ -91,10 +94,19 @@ for (const provider of ['llm', 'jev'] as const) {
     const full = await service.suggest(request, 'model-review');
     assert(full.ok);
     assert.equal(full.body.cached, undefined);
+    assert.equal(full.body.judge, provider);
+    assert.equal(typeof full.body.model, 'string');
+    assert(full.body.model!.length > 0);
+    assert(full.body.suggestions.every(item => item.source === provider));
+    const calls = provider === 'llm' ? service.llmCalls : service.jevCalls;
+    const previousCalls = calls.usedCount;
+    const previousSpent = service.budget.spentUsd;
     const repeated = await service.suggest(request, 'model-review');
     assert(repeated.ok);
     assert.equal(repeated.body.cached, true);
     assert.deepEqual(repeated.body.suggestions, full.body.suggestions);
+    assert.equal(calls.usedCount, previousCalls);
+    assert.equal(service.budget.spentUsd, previousSpent);
     await service.flushCache();
     const restarted = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
     assert.equal((await restarted.loadCache()).loaded, 1);
@@ -102,10 +114,36 @@ for (const provider of ['llm', 'jev'] as const) {
     assert(restored.ok);
     assert.equal(restored.body.cached, true);
     assert.deepEqual(restored.body.suggestions, full.body.suggestions);
+    assert.equal(restarted.jevCalls.usedCount, 0);
+    assert.equal(restarted.llmCalls.usedCount, 0);
+    assert.equal(restarted.budget.spentUsd, 0);
     const refreshed = await restarted.suggest({ ...request, refresh: true }, 'model-review');
     assert(refreshed.ok);
     assert.equal(refreshed.body.cached, undefined);
     await restarted.flushCache();
+    const persisted = JSON.parse(await readFile(cachePath, 'utf8')) as {
+      entries: Array<{ key: string; expiresAt: number; coverage?: string[]; body: unknown }>;
+    };
+    for (const entry of persisted.entries) delete entry.coverage;
+    await writeFile(cachePath, JSON.stringify(persisted));
+    const legacy = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    assert.equal((await legacy.loadCache()).loaded, 1);
+    const recalculated = await legacy.suggest(request, 'model-review');
+    assert(recalculated.ok);
+    assert.equal(recalculated.body.cached, undefined);
+    assert((provider === 'llm' ? legacy.llmCalls : legacy.jevCalls).usedCount > 0);
+    await legacy.flushCache();
+    await writeFile(cachePath, '{ invalid cache JSON');
+    const corrupted = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    assert.deepEqual(await corrupted.loadCache(), { loaded: 0, dropped: 0 });
+    const fresh = await corrupted.suggest({ ...request, blocks: [blocks[0]!,
+      { id: 'footer', text: '在 GitHub 上编辑此页，贡献者信息与版权说明。' }] }, 'model-review');
+    assert(fresh.ok);
+    assert.equal(fresh.body.cached, undefined);
+    assert(fresh.body.degraded.some(item => item.id === 'footer' && item.reason === 'not_in_page'));
+    assert(fresh.body.suggestions.every(item => item.id === blocks[0]!.id));
+    assert((provider === 'llm' ? corrupted.llmCalls : corrupted.jevCalls).usedCount > 0);
+    await corrupted.flushCache();
   });
 }
 if (pending) process.exitCode = 1;
