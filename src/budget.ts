@@ -128,6 +128,7 @@ export class DailyCounter {
   }
 
   get usedCount(): number {
+    this.resetIfNewDay();
     return this.used;
   }
 

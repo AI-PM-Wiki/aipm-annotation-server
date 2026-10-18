@@ -12,7 +12,9 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "unit-check": "tsx src/unit-check.ts",
+    "unit-check": "node --import tsx src/unit-check.ts",
+    "model-check": "node --import tsx src/model-check.ts",
+    "durability-check": "node --import tsx test/durability-check.ts && node --import tsx test/waiting-flush-check.ts && node --import tsx test/operation-record-check.ts && node --import tsx test/restart-retry-check.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

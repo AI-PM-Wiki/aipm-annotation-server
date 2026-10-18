@@ -70,10 +70,7 @@ export interface LlmCallResult {
   model?: string;
 }
 
-/**
- * 真正的模型调用缝:provider 只认识这个函数签名,于是单测可以注入 fake,
- * **不需要联网**(单测禁止真实调用模型)。
- */
+/** Anthropic 请求与解析结果的调用接口。 */
 export type LlmCaller = (params: LlmCallParams) => Promise<LlmCallResult>;
 
 /** 线上格式:官方端点用结构化输出;Anthropic 兼容端点用纯文本 + 自己解析。 */
@@ -123,7 +120,7 @@ export function parseJsonOutput(text: string): unknown {
   }
 }
 
-/** 最小客户端契约:只为让单测能注入假客户端(不联网)。 */
+/** JSON 输出模式使用的 Messages 客户端接口。 */
 export interface MessagesClientLike {
   messages: {
     create(
@@ -176,8 +173,7 @@ export function createAnthropicCaller(opts: AnthropicCallerOptions): LlmCaller {
     // 只留平台侧 1 次重试;调用级重试由 provider 自己做(要把校验错误回灌)
     maxRetries: 1,
   });
-  // SDK 的 create 是带严格参数类型的重载,与上面这个「够用就好」的最小契约结构不兼容
-  // (契约的存在只是为了让单测塞假客户端)。这一次 cast 是有意为之,不是绕过类型检查。
+  // SDK 的参数重载在此适配为 JSON 模式使用的客户端接口。
   if (opts.mode === 'json') return createJsonCaller(client as unknown as MessagesClientLike);
   return async (params: LlmCallParams): Promise<LlmCallResult> => {
     const message = await client.messages.parse(
