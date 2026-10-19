@@ -1264,7 +1264,7 @@ async function main(): Promise<void> {
   if (cacheLoaded.loaded > 0 || cacheLoaded.dropped > 0) {
     console.log(
       `[server] 判分缓存加载: ${cacheLoaded.loaded} 条` +
-        `${cacheLoaded.dropped > 0 ? `(丢弃过期/损坏 ${cacheLoaded.dropped} 条)` : ''}`,
+        `${cacheLoaded.dropped > 0 ? `(丢弃损坏记录 ${cacheLoaded.dropped} 条)` : ''}`,
     );
   }
 

@@ -111,7 +111,6 @@ interface ChunkOutcome {
 }
 
 interface CacheEntry {
-  expiresAt: number;
   /**
    * 这一份结果判过哪些块:写入时,这次请求实际送进判分流程的那些块 id
    * (抽样校验通过的),不从 suggestions 反推 —— 判过而没结论的块(值得高亮的
@@ -254,10 +253,6 @@ export class HighlightService {
   private readCache(key: string, wanted: Set<string>): SuggestBody | null {
     const entry = this.cache.get(key);
     if (entry === undefined) return null;
-    if (entry.expiresAt <= this.now()) {
-      this.cache.delete(key);
-      return null;
-    }
     /* 先校验覆盖面:这一格只答得了它判过的那些块。请求里有一块不在覆盖面内
        (旧前端送过子集,如今整页来了),或者这一份根本没记覆盖面(旧版本写下的
        记录),都按未命中处理 —— 重新判一轮整页,判完覆盖这一格。 */
@@ -276,32 +271,16 @@ export class HighlightService {
    * 这一格答不答得了某次请求。判分失败那条路不会走到这里,旧缓存原样留着。
    */
   private writeCache(key: string, coverage: Set<string>, body: SuggestBody): void {
-    const h = this.config.highlight;
-    if (h.cacheTtlMs <= 0 || h.cacheMaxEntries <= 0) return;
-    if (this.cache.size >= h.cacheMaxEntries) {
-      // 简易 LRU:Map 保持插入序,淘汰最旧的一条
-      const oldest = this.cache.keys().next();
-      if (!oldest.done) this.cache.delete(oldest.value);
-    }
     this.cache.set(key, {
-      expiresAt: this.now() + h.cacheTtlMs,
       coverage,
       body: { ...body, cached: undefined },
     });
     this.scheduleCacheSave();
   }
 
-  /**
-   * 启动加载落盘的缓存。
-   *
-   * 容忍坏文件:解析不了、形状不对、过期的条目一律丢掉,绝不让一个缓存文件把
-   * 服务挡在启动之外(它只是省钱用的,不是数据)。多出来的条目按过期时间保留
-   * 最新的 maxEntries 条 —— 与运行期的淘汰策略一致。
-   */
+  /** 启动时从磁盘读取全部有效缓存记录。 */
   async loadCache(): Promise<{ loaded: number; dropped: number }> {
     if (this.cachePath === null) return { loaded: 0, dropped: 0 };
-    const h = this.config.highlight;
-    if (h.cacheTtlMs <= 0 || h.cacheMaxEntries <= 0) return { loaded: 0, dropped: 0 };
     let raw: string;
     try {
       raw = await readFile(this.cachePath, 'utf8');
@@ -317,9 +296,8 @@ export class HighlightService {
       return { loaded: 0, dropped: 0 };
     }
     let dropped = 0;
-    let entries: Array<{
+    const entries: Array<{
       key: string;
-      expiresAt: number;
       coverage: Set<string> | null;
       body: SuggestBody;
     }> = [];
@@ -327,7 +305,7 @@ export class HighlightService {
       const parsed: unknown = JSON.parse(raw);
       const list = isRecord(parsed) && Array.isArray(parsed.entries) ? parsed.entries : [];
       for (const item of list) {
-        if (!isRecord(item) || typeof item.key !== 'string' || typeof item.expiresAt !== 'number') {
+        if (!isRecord(item) || typeof item.key !== 'string') {
           dropped++;
           continue;
         }
@@ -335,13 +313,8 @@ export class HighlightService {
           dropped++;
           continue;
         }
-        if (item.expiresAt <= this.now()) {
-          dropped++;
-          continue;
-        }
         entries.push({
           key: item.key,
-          expiresAt: item.expiresAt,
           /* 旧记录没有覆盖面:照常加载(它只是一份缓存,不该挡启动),读的时候
              按未命中处理 —— 不知道判过哪些块的一份,答不了任何一次请求。 */
           coverage: parseCoverage(item.coverage),
@@ -355,10 +328,8 @@ export class HighlightService {
     } catch {
       return { loaded: 0, dropped: 0 };
     }
-    entries.sort((a, b) => a.expiresAt - b.expiresAt);
-    if (entries.length > h.cacheMaxEntries) entries = entries.slice(entries.length - h.cacheMaxEntries);
     for (const e of entries) {
-      this.cache.set(e.key, { expiresAt: e.expiresAt, coverage: e.coverage, body: e.body });
+      this.cache.set(e.key, { coverage: e.coverage, body: e.body });
     }
     return { loaded: entries.length, dropped };
   }
@@ -383,7 +354,6 @@ export class HighlightService {
     }
     const entries = [...this.cache.entries()].map(([key, entry]) => ({
       key,
-      expiresAt: entry.expiresAt,
       coverage: entry.coverage === null ? null : [...entry.coverage],
       body: entry.body,
     }));

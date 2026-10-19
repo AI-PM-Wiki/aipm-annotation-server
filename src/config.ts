@@ -64,10 +64,6 @@ export interface HighlightConfig {
   llmInputCostPerMtok: number;
   llmOutputCostPerMtok: number;
   jevInputCostPerMtok: number;
-
-  /** 同页结果缓存:key = 页面内容 hash + judge + 色板版本。 */
-  cacheTtlMs: number;
-  cacheMaxEntries: number;
 }
 
 export interface Config {
@@ -238,13 +234,6 @@ const EnvSchema = z.object({
   // 见 https://docs.typesafe.ai/models.md。此前默认 0(当时以为计价未公开),
   // 那会让日预算护栏对 Jev 完全失效 —— 只剩调用次数上限在兜底。
   JEV_INPUT_COST_PER_MTOK: z.coerce.number().min(0).default(0.042),
-
-  // 同页判分结果缓存。key 里有页面内容 hash,所以「内容没变就复用」是安全的:
-  // TTL 只用来限制**答案**的陈旧度(判分模型/口径会变),不需要短到分钟级。
-  // 默认 7 天 + 落盘(DATA_DIR/highlight-cache.json):一次判分的结果能被这一周里
-  // 所有访客复用,重启/重新部署也不丢 —— 匿名端点上的重复请求本就不该重复花钱。
-  HIGHLIGHT_CACHE_TTL_MS: z.coerce.number().int().min(0).default(7 * 24 * 3600 * 1000),
-  HIGHLIGHT_CACHE_MAX_ENTRIES: z.coerce.number().int().min(0).max(10_000).default(800),
 });
 
 function parseBool(value: string): boolean {
@@ -400,9 +389,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       llmInputCostPerMtok: e.LLM_INPUT_COST_PER_MTOK,
       llmOutputCostPerMtok: e.LLM_OUTPUT_COST_PER_MTOK,
       jevInputCostPerMtok: e.JEV_INPUT_COST_PER_MTOK,
-
-      cacheTtlMs: e.HIGHLIGHT_CACHE_TTL_MS,
-      cacheMaxEntries: e.HIGHLIGHT_CACHE_MAX_ENTRIES,
     },
   };
 }
