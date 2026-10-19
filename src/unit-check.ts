@@ -15,7 +15,7 @@ import {
   removeReply, toClientJson, toHypothesisExport,
 } from './annotations.ts';
 import {
-  PageTextIndex, canonicalPage, decodeEntities, normalizeForMatch,
+  PageTextIndex, canonicalPage, decodeEntities, hashPageText, normalizeForMatch,
   normalizeIndexText, normalizePagePath, verifyBlocks,
 } from './index-store.ts';
 import { DailyBudget, DailyCounter } from './budget.ts';
@@ -820,7 +820,7 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
       primary: h.primary, fallback: h.fallback, worthThreshold: h.worthThreshold,
     });
   });
-  await t.test('cache corruption and expired entries use real disk and do not prevent HTTP readiness', async () => {
+  await t.test('cache corruption and legacy timestamps use real disk and preserve HTTP readiness', async () => {
     const cachePath = join(dataDir, 'highlight-cache.json');
     await writeFile(cachePath, '{ invalid JSON', 'utf8');
     assert.deepEqual(await highlight.loadCache(), { loaded: 0, dropped: 0 });
@@ -834,8 +834,54 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
       { invalid: true },
       { key: 'live', expiresAt: Date.now() + 60000, body: ruled.body },
     ] }));
-    assert.deepEqual(await highlight.loadCache(), { loaded: 1, dropped: 3 });
+    assert.deepEqual(await highlight.loadCache(), { loaded: 2, dropped: 2 });
     assert.equal((await call('/healthz')).status, 200);
+  });
+  await t.test('permanent cache retains every record across disk writes and restarts', async () => {
+    const cachePath = join(dataDir, 'permanent-highlight-cache.json');
+    const blocks = [{ id: 'b1', text: normalizeIndexText(index.pageText(page)).slice(0, 1) }];
+    const ruled = await highlight.suggest({ page, title: 'RAG', palette, blocks, judge: 'auto' }, 'cache-review');
+    assert(ruled.ok);
+    assert.equal(ruled.body.judge, 'rules');
+    const contentHash = hashPageText(index.pageText(page));
+    const palettes = Array.from({ length: 805 }, (_, i) => [
+      { ...palette[0]!, when: `${palette[0]!.when} ${i}` },
+    ]);
+    const entries = palettes.map(current => ({
+      key: `${page}\u0000${contentHash}\u0000auto\u0000${current[0]!.id}:${current[0]!.when}`,
+      expiresAt: 1,
+      coverage: blocks.map(block => block.id),
+      body: ruled.body,
+    }));
+    await writeFile(cachePath, JSON.stringify({ version: 1, entries }));
+    const permanent = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    assert.deepEqual(await permanent.loadCache(), { loaded: entries.length, dropped: 0 });
+    for (const current of palettes) {
+      const result = await permanent.suggest({ page, title: 'RAG', palette: current, blocks, judge: 'auto' }, 'cache-review');
+      assert(result.ok);
+      assert.equal(result.body.cached, true);
+      assert.deepEqual(result.body.degraded, ruled.body.degraded);
+    }
+    assert.equal(permanent.jevCalls.usedCount, 0);
+    assert.equal(permanent.llmCalls.usedCount, 0);
+    assert.equal(permanent.budget.spentUsd, 0);
+    await permanent.flushCache();
+    const persisted = JSON.parse(await readFile(cachePath, 'utf8')) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    assert.equal(persisted.entries.length, entries.length);
+    assert(persisted.entries.every(entry => !Object.hasOwn(entry, 'expiresAt')));
+    const restarted = new HighlightService({ config, index, judges: { jev, llm }, cachePath });
+    assert.deepEqual(await restarted.loadCache(), { loaded: entries.length, dropped: 0 });
+    for (const current of [palettes[0]!, palettes[palettes.length - 1]!]) {
+      const result = await restarted.suggest({ page, title: 'RAG', palette: current, blocks, judge: 'auto' }, 'cache-review');
+      assert(result.ok);
+      assert.equal(result.body.cached, true);
+      assert.deepEqual(result.body.degraded, ruled.body.degraded);
+    }
+    assert.equal(restarted.jevCalls.usedCount, 0);
+    assert.equal(restarted.llmCalls.usedCount, 0);
+    assert.equal(restarted.budget.spentUsd, 0);
   });
   await t.test('disabled dev authentication has no HTTP endpoint', async () => {
     const disabled = createApp({ config: { ...config, devAuthBypass: false }, store, auth, index, highlight }).server;

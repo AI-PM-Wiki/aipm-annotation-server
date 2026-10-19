@@ -62,7 +62,7 @@ for (const provider of ['llm', 'jev'] as const) {
     const config = loadConfig({ HOST: '127.0.0.1', DEV_AUTH_BYPASS: 'true', DATA_DIR: data,
       SEARCH_INDEX_URL: `http://127.0.0.1:${(staticServer.address() as { port: number }).port}/search/search_index.json`,
       HIGHLIGHT_JUDGE_PRIMARY: provider, HIGHLIGHT_JUDGE_FALLBACK: 'none',
-      HIGHLIGHT_RATE_LIMIT_MAX: '100', HIGHLIGHT_CACHE_TTL_MS: '600000', HIGHLIGHT_WORTH_THRESHOLD: '0',
+      HIGHLIGHT_RATE_LIMIT_MAX: '100', HIGHLIGHT_WORTH_THRESHOLD: '0',
       ...(provider === 'llm' ? {
         ANTHROPIC_API_KEY: process.env.AIPM_REAL_MODEL_API_KEY!,
         ANTHROPIC_BASE_URL: baseUrl.href, HIGHLIGHT_MODEL: process.env.AIPM_REAL_MODEL_NAME!,
@@ -179,7 +179,7 @@ for (const provider of ['llm', 'jev'] as const) {
     assertConclusions(refreshed.body, blocks.map(item => item.id));
     await restarted.flushCache();
     const persisted = JSON.parse(await readFile(cachePath, 'utf8')) as {
-      version: number; entries: Array<{ key: string; expiresAt: number; coverage?: string[]; body: unknown }>;
+      version: number; entries: Array<{ key: string; coverage?: string[]; body: unknown }>;
     };
     assert.equal(persisted.version, 1);
     for (const entry of persisted.entries) delete entry.coverage;
