@@ -78,6 +78,11 @@ GET    /api/annotations/export?page=<path>                # hypothes.is JSON 兼
 锚不到时进「孤儿批注」而不是静默丢失。归属按 `author.githubId`(数字 id)判定 ——
 不拿 login 当键,login 可以改。
 
+界面统一使用 GitHub 登录 ID `login`，保留 GitHub 返回的大小写。每次 GitHub 登录
+成功后，服务按 `githubId` 更新该用户在历史批注、评论、回复和已有会话中的
+登录 ID 与头像。内容、发布时间、编辑时间、点赞和归属保持原值。
+登录 ID 更新在下一次登录时同步，大小写变更同样参与同步。
+
 `target.scope: "page"` 标记全页评论(见上表后的说明)。**空 selector 默认仍然被拒绝**:
 只有显式声明了 `scope: "page"` 才放行 ——「忘了带锚点」与「就是要整页评论」必须分开,
 这道判断在 `src/server.ts` 的 `CreateAnnotationSchema` 与 `normalizeSelectors` 的

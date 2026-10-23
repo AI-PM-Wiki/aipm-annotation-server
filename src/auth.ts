@@ -238,6 +238,7 @@ export class AuthService {
   /** 签发会话(只存 hash);返回明文 token。 */
   issueSession(user: GithubUser): string {
     const token = this.randomToken();
+    this.store.refreshAuthor(user);
     const createdAt = new Date(this.now()).toISOString();
     const session: SessionRecord = {
       tokenHash: hashToken(token),
