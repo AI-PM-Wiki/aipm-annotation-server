@@ -17,6 +17,7 @@
  *   DELETE /api/annotations/:id/replies/:rid  回复作者,或批注作者
  *   PUT    /api/annotations/:id/like          需登录;幂等
  *   DELETE /api/annotations/:id/like          需登录;幂等
+ *   POST   /api/annotations/:id/local         仅作者;移除内容并保留点赞
  *   PATCH  /api/annotations/:id               需登录 + 仅作者
  *   DELETE /api/annotations/:id               需登录 + 仅作者(版主可删公开)
  *   GET    /api/annotations/export?page=      hypothes.is JSON 兼容导出
@@ -56,7 +57,7 @@ import {
   normalizeStyle,
   normalizeVisibility,
   removeReply,
-  toClientJson,
+  toClientJson as serializeAnnotation,
   toHypothesisExport,
 } from './annotations.ts';
 import type { ReplyInput } from './annotations.ts';
@@ -68,6 +69,8 @@ import type { HighlightRequest } from './highlight/index.ts';
 
 const CreateAnnotationSchema = z.object({
   requestId: z.string().min(8).max(128).regex(/^[A-Za-z0-9_-]+$/).optional(),
+  likeId: z.string().uuid().optional(),
+  likedByMe: z.boolean().optional(),
   page: z.string().min(1).max(512),
   // 空正文合法:纯高亮没有文字(见 normalizeBody 的 allowEmpty)
   body: z.string().max(20_000),
@@ -341,6 +344,12 @@ export function createApp(deps: ServerDeps) {
     return store.annotations.filter((a) => a.page === page);
   }
 
+  function toClientJson(record: AnnotationRecord, actor: Author | null) {
+    const likes = store.getLikes(record.id);
+    if (likes === undefined) throw new Error('annotation likes missing');
+    return serializeAnnotation(record, actor, likes.likes);
+  }
+
   async function handleIssuePermit(
     req: IncomingMessage, res: ServerResponse, cors: Record<string, string>,
     actor: Author | null | 'rejected',
@@ -480,6 +489,8 @@ export function createApp(deps: ServerDeps) {
     const digest = createHash('sha256').update(JSON.stringify({
       page, body: body.value, color: color.value, style: style.value,
       visibility: visibility.value, scope: pageScope ?? null, selectors: selectors.value,
+      ...(parsed.data.likeId === undefined ? {} : { likeId: parsed.data.likeId }),
+      ...(parsed.data.likedByMe === undefined ? {} : { likedByMe: parsed.data.likedByMe }),
     })).digest('hex');
 
     const requestId = parsed.data.requestId;
@@ -517,6 +528,16 @@ export function createApp(deps: ServerDeps) {
       return;
     }
     permits.delete(permitToken as string);
+    const previousLikes = parsed.data.likeId === undefined ? undefined : store.getLikes(parsed.data.likeId);
+    if (parsed.data.likeId !== undefined &&
+        (previousLikes === undefined || previousLikes.authorId !== user.githubId)) {
+      sendError(req, res, 404, 'not_found', '点赞记录不存在', cors);
+      return;
+    }
+    if (previousLikes !== undefined && store.annotations.some((item) => item.id === previousLikes.id)) {
+      sendError(req, res, 409, 'annotation_exists', '批注已经保存在服务端', cors);
+      return;
+    }
     if (store.annotations.length >= config.maxAnnotations) {
       sendError(req, res, 507, 'storage_full', '批注存储已达容量上限', cors);
       return;
@@ -535,7 +556,7 @@ export function createApp(deps: ServerDeps) {
 
     const now = new Date().toISOString();
     const record: AnnotationRecord = {
-      id: newAnnotationId(),
+      id: previousLikes?.id ?? newAnnotationId(),
       requestId,
       page,
       visibility: visibility.value,
@@ -547,7 +568,6 @@ export function createApp(deps: ServerDeps) {
         ? { selectors: selectors.value }
         : { selectors: selectors.value, scope: pageScope },
       replies: [],
-      likes: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -556,6 +576,8 @@ export function createApp(deps: ServerDeps) {
       page, visibility: visibility.value, createdAt: now,
     };
     store.addAnnotationWithOperation(record, operation);
+    const likes = previousLikes ?? { id: record.id, authorId: user.githubId, likes: [] };
+    store.setLikes(parsed.data.likedByMe === undefined ? likes : applyLike(likes, user, parsed.data.likedByMe));
     try {
       await store.flush();
       if (!store.hasPersistedAnnotation(record.id)) {
@@ -563,6 +585,8 @@ export function createApp(deps: ServerDeps) {
       }
     } catch {
       store.removeAnnotationWithOperation(record.id, operation);
+      if (previousLikes === undefined) store.removeLikes(record.id);
+      else store.setLikes(previousLikes);
       sendError(req, res, 503, 'storage_failed', '批注未能保存', cors);
       return;
     }
@@ -763,12 +787,40 @@ export function createApp(deps: ServerDeps) {
       sendError(req, res, 404, 'not_found', '批注不存在', cors);
       return;
     }
-    const next = applyLike(record, user, liked);
-    if (next !== record) {
-      store.setAnnotations(store.annotations.map((a) => (a.id === id ? next : a)));
+    const likes = store.getLikes(id);
+    if (likes === undefined) throw new Error('annotation likes missing');
+    const next = applyLike(likes, user, liked);
+    if (next !== likes) {
+      store.setLikes(next);
       await store.flush();
     }
-    writeJson(res, 200, { annotation: toClientJson(next, user) }, cors);
+    writeJson(res, 200, { annotation: toClientJson(record, user) }, cors);
+  }
+
+  async function handleMoveToLocal(
+    req: IncomingMessage, res: ServerResponse, id: string,
+    cors: Record<string, string>, actor: Author | null | 'rejected',
+  ): Promise<void> {
+    const user = requireLogin(req, res, cors, actor);
+    if (user === null) return;
+    const likes = store.getLikes(id);
+    if (likes === undefined || likes.authorId !== user.githubId) {
+      sendError(req, res, 404, 'not_found', '批注不存在', cors);
+      return;
+    }
+    const snapshot = { likeId: id, likeCount: likes.likes.length, likedByMe: likes.likes.includes(user.githubId) };
+    const record = store.annotations.find((item) => item.id === id);
+    if (record !== undefined) store.setAnnotations(store.annotations.filter((item) => item.id !== id));
+    try {
+      await store.flush();
+    } catch {
+      if (record !== undefined && !store.annotations.some((item) => item.id === id)) {
+        store.setAnnotations([...store.annotations, record]);
+      }
+      sendError(req, res, 503, 'storage_failed', '批注未能改为仅本机', cors);
+      return;
+    }
+    writeJson(res, 200, snapshot, cors);
   }
 
   async function handleDeleteAnnotation(
@@ -790,6 +842,7 @@ export function createApp(deps: ServerDeps) {
       return;
     }
     store.setAnnotations(store.annotations.filter((a) => a.id !== id));
+    store.removeLikes(id);
     await store.flush();
     writeJson(res, 200, { deleted: id }, cors);
   }
@@ -1189,6 +1242,13 @@ export function createApp(deps: ServerDeps) {
       const id = decodeURIComponent(replyOneMatch[1]!);
       const replyId = decodeURIComponent(replyOneMatch[2]!);
       void handleDeleteReply(req, res, id, replyId, cors, authenticate(req, res, cors)).catch(fail);
+      return;
+    }
+
+    const localMatch = /^\/api\/annotations\/([^/]+)\/local$/.exec(path);
+    if (localMatch !== null && method === 'POST') {
+      const id = decodeURIComponent(localMatch[1]!);
+      void handleMoveToLocal(req, res, id, cors, authenticate(req, res, cors)).catch(fail);
       return;
     }
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rmdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -38,7 +38,7 @@ const palette = [
 function record(over: Partial<AnnotationRecord> = {}): AnnotationRecord {
   return { id: 'a1', page, visibility: 'public', color: 'yellow', style: 'highlight',
     body: '正文', author: alice, target: { selectors: [{ type: 'TextQuoteSelector', exact: '文本' }] },
-    replies: [], likes: [], createdAt: '2026-01-01T00:00:00.000Z',
+    replies: [], createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z', ...over };
 }
 
@@ -102,11 +102,10 @@ await test('visibility, ownership, moderator and export privacy', () => {
   assert.deepEqual(filterForScope(records, 'public', null).map(item => item.id), ['p1', 'p2']);
   assert.deepEqual(filterForScope(records, 'mine', alice).map(item => item.id), ['p1', 'v1']);
   assert.deepEqual(filterForScope(records, 'mine', null), []);
-  const liked = applyLike(record(), bob, true);
+  const liked = applyLike({ id: 'a1', authorId: alice.githubId, likes: [] }, bob, true);
   assert.equal(applyLike(liked, bob, true), liked);
   assert.equal(applyLike(liked, alice, false), liked);
-  assert.equal(liked.updatedAt, record().updatedAt);
-  const client = toClientJson(liked, bob);
+  const client = toClientJson(record(), bob, liked.likes);
   assert.equal(client.likeCount, 1);
   assert.equal(client.likedByMe, true);
   assert(!('likes' in client));
@@ -178,6 +177,15 @@ await test('storage parsing and stable identity', () => {
   const parsed = parseState(JSON.stringify({ version: 1, annotations: [record()], sessions: [] }));
   assert.equal(parsed.dropped, 0);
   assert.deepEqual(parsed.state.annotations, [{ ...record(), requestId: undefined }]);
+  const migrated = parseState(JSON.stringify({ annotations: [{ ...record(), likes: [7, 42, 7] }] })).state;
+  assert.deepEqual(migrated.likes, [{ id: 'a1', authorId: 42, likes: [7, 42] }]);
+  assert(!('likes' in migrated.annotations[0]!));
+  assert.deepEqual(parseState(JSON.stringify(migrated)).state.likes, migrated.likes);
+  const detached = { ...migrated, annotations: [] };
+  assert.deepEqual(parseState(JSON.stringify(detached)).state.likes, migrated.likes);
+  assert.throws(() => parseState(JSON.stringify({ ...migrated, likes: 'invalid' })));
+  assert.throws(() => parseState(JSON.stringify({ ...migrated,
+    likes: [{ id: 'a1', authorId: 7, likes: [42] }] })));
   assert.throws(() => parseState('{'));
   assert.throws(() => parseState('[]'));
   assert.throws(() => parseState(JSON.stringify({ operations: 'invalid' })));
@@ -404,13 +412,13 @@ await test('page scope survives storage and Hypothesis export preserves selector
   assert.equal(parsed.state.annotations.length, 2);
   assert.equal(parsed.state.annotations[0]!.target.scope, 'page');
   assert.equal(parsed.state.annotations[1]!.target.scope, undefined);
-  const liked = applyLike(applyLike(record(), bob, true), alice, true);
+  const liked = applyLike(applyLike({ id: 'a1', authorId: alice.githubId, likes: [] }, bob, true), alice, true);
   assert.equal(liked.likes.length, 2);
-  assert.equal(toClientJson(liked, null).likeCount, 2);
-  assert.equal(toClientJson(liked, null).likedByMe, false);
-  assert.equal(toClientJson(liked, bob).likedByMe, true);
-  assert(!('likes' in toClientJson(liked, null)));
-  assert.deepEqual(applyLike(applyLike(record(), bob, true), bob, false).likes, []);
+  assert.equal(toClientJson(record(), null, liked.likes).likeCount, 2);
+  assert.equal(toClientJson(record(), null, liked.likes).likedByMe, false);
+  assert.equal(toClientJson(record(), bob, liked.likes).likedByMe, true);
+  assert(!('likes' in toClientJson(record(), null, liked.likes)));
+  assert.deepEqual(applyLike(applyLike({ id: 'a1', authorId: alice.githubId, likes: [] }, bob, true), bob, false).likes, []);
 });
 
 await test('real semaphore queue capacity, timeout, abort and release', async () => {
@@ -601,6 +609,75 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
     assert.equal((await call('/api/annotation-permits', aliceToken, 'POST',
       { ...payload, requestId: randomUUID(), target: { selectors: [] } })).status, 400);
   });
+  await t.test('likes survive visibility changes and content transfers', async () => {
+    for (const target of [{ scope: 'page', selectors: [] },
+      { selectors: [{ type: 'TextQuoteSelector', exact: '文本' }] }]) {
+      const input = { ...payload, requestId: randomUUID(), visibility: 'public', target };
+      const permit = await call('/api/annotation-permits', aliceToken, 'POST', input);
+      const created = await call('/api/annotations', aliceToken, 'POST', input, permit.body.permit);
+      assert.equal(created.status, 201);
+      const id = created.body.annotation.id;
+      const path = `/api/annotations/${id}`;
+      await call(path + '/like', bobToken, 'PUT');
+      await call(path + '/like', aliceToken, 'PUT');
+      const updatedAt = (await call(path, aliceToken)).body.annotation.updatedAt;
+      assert.equal((await call(path + '/like', aliceToken, 'PUT')).body.annotation.updatedAt, updatedAt);
+      for (const visibility of ['private', 'public', 'private']) {
+        const changed = await call(path, aliceToken, 'PATCH', { visibility });
+        assert.equal(changed.body.annotation.likeCount, 2);
+        assert.equal(changed.body.annotation.likedByMe, true);
+      }
+      await call(path, aliceToken, 'PATCH', { visibility: 'public' });
+      await call(path + '/like', bobToken, 'DELETE');
+      await Promise.all([
+        call(path, aliceToken, 'PATCH', { body: input.body }),
+        call(path + '/like', bobToken, 'PUT'),
+      ]);
+      assert.equal((await call(path, aliceToken)).body.annotation.likeCount, 2);
+      await mkdir(store.path + '.tmp');
+      try {
+        assert.equal((await call(path + '/local', aliceToken, 'POST')).status, 503);
+        assert.equal((await call(path, aliceToken)).body.annotation.likeCount, 2);
+      } finally {
+        await rmdir(store.path + '.tmp');
+      }
+      const moved = await call(path + '/local', aliceToken, 'POST');
+      assert.equal(moved.status, 200);
+      assert.deepEqual(moved.body, { likeId: id, likeCount: 2, likedByMe: true });
+      assert.deepEqual((await call(path + '/local', aliceToken, 'POST')).body, moved.body);
+      assert.equal((await call(path + '/local', bobToken, 'POST')).status, 404);
+      assert.equal((await call(path, aliceToken)).status, 404);
+      assert(!store.annotations.some((annotation) => annotation.id === id));
+      const restarted = new AnnotationStore(config.dataDir);
+      await restarted.load();
+      assert.deepEqual(new Set(restarted.getLikes(id)?.likes), new Set([bob.githubId, alice.githubId]));
+      const stolen = { ...input, requestId: randomUUID(), likeId: id, likedByMe: true };
+      const forbiddenPermit = await call('/api/annotation-permits', bobToken, 'POST', stolen);
+      assert.equal((await call('/api/annotations', bobToken, 'POST', stolen, forbiddenPermit.body.permit)).status, 404);
+      for (const visibility of ['public', 'private']) {
+        const restore = { ...input, requestId: randomUUID(), likeId: id, likedByMe: true, visibility };
+        const permission = await call('/api/annotation-permits', aliceToken, 'POST', restore);
+        const restored = await call('/api/annotations', aliceToken, 'POST', restore, permission.body.permit);
+        assert.equal(restored.status, 201);
+        assert.equal(restored.body.annotation.id, id);
+        assert.equal(restored.body.annotation.likeCount, 2);
+        assert.equal(restored.body.annotation.likedByMe, true);
+        assert(!('likes' in restored.body.annotation));
+        const duplicate = { ...restore, requestId: randomUUID() };
+        const duplicatePermit = await call('/api/annotation-permits', aliceToken, 'POST', duplicate);
+        assert.equal((await call('/api/annotations', aliceToken, 'POST', duplicate, duplicatePermit.body.permit)).status, 409);
+        await call(path + '/local', aliceToken, 'POST');
+      }
+      const unliked = { ...input, requestId: randomUUID(), likeId: id, likedByMe: false };
+      const unlikedPermit = await call('/api/annotation-permits', aliceToken, 'POST', unliked);
+      const restored = await call('/api/annotations', aliceToken, 'POST', unliked, unlikedPermit.body.permit);
+      assert.equal(restored.body.annotation.likeCount, 1);
+      assert.equal(restored.body.annotation.likedByMe, false);
+      assert.equal((await call(path, aliceToken, 'DELETE')).status, 200);
+      assert.equal(store.getLikes(id), undefined);
+    }
+  });
+
   await t.test('like privacy and idempotence', async () => {
     const publicRecord = store.annotations.find(item => item.visibility === 'public')!;
     const url = `/api/annotations/${publicRecord.id}/like`;

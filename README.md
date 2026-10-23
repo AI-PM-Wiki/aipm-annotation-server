@@ -103,9 +103,15 @@ GET    /api/annotations/export?page=<path>                # hypothes.is JSON 兼
 
 ### 点赞
 
-`likes` 存的是**点过赞的人的 GitHub 数字 id 列表**,但对外**只回 `likeCount` 与
-`likedByMe`**,不回原始名单 —— 谁赞过既是隐私面(能看出谁读了哪一页)又没有展示价值。
-`toClientJson` 是唯一的出口,所有返回批注的响应都过它。
+点赞保存在 `store.json` 的独立 `likes` 集合中，每份记录包含批注标识、作者账号与
+点赞账号。批注内容通过相同标识关联点赞，对外只返回 `likeCount` 和 `likedByMe`。
+启动时自动迁移原有批注中的 `likes` 数组。
+
+`POST /api/annotations/:id/local` 仅允许作者调用，移除服务端内容并保留点赞记录，
+返回 `{ likeId, likeCount, likedByMe }`。浏览器保存内容与计数快照，本机点赞在浏览器
+更新。重新上传时，创建请求及确认许可携带 `likeId` 与 `likedByMe`，服务端核验作者、
+沿用原标识与已有点赞账号，并同步作者自己的点赞状态。公开与私有之间的切换只更新
+可见范围。普通删除同时移除内容和点赞记录。
 
 `PUT` / `DELETE` 都**幂等**:已赞再赞、未赞再取消都返回成功且不改变计数,客户端重试与
 连点不必自己去重。点赞不碰 `updatedAt` —— 点个赞不该让这条显示成「刚编辑过」。

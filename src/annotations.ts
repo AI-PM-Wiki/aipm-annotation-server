@@ -14,6 +14,7 @@ import type {
   AnnotationRecord,
   AnnotationStyle,
   Author,
+  LikeRecord,
   Reply,
   Selector,
   Visibility,
@@ -355,18 +356,12 @@ export function removeReply(
 // 点赞
 // ---------------------------------------------------------------------------
 
-/**
- * 点赞 / 取消点赞。**幂等**:已经赞过再赞、没赞过再取消,都返回原对象
- * (调用方可用 `next === record` 判断要不要落盘),这样客户端重试不会把计数点乱。
- *
- * likes 存 GitHub 数字 id 而不是 login(login 可改);不碰 updatedAt —— 点个赞
- * 不该让这条批注显示成「刚编辑过」。
- */
+/** 点赞记录按 GitHub 数字 id 去重，重复操作返回原对象。 */
 export function applyLike(
-  record: AnnotationRecord,
+  record: LikeRecord,
   actor: Author,
   liked: boolean,
-): AnnotationRecord {
+): LikeRecord {
   const has = record.likes.includes(actor.githubId);
   if (has === liked) return record;
   const likes = liked
@@ -378,15 +373,14 @@ export function applyLike(
 /**
  * 对外的批注形态。
  *
- * 原始记录里的 `likes` 是**点过赞的人的 GitHub id 列表** —— 直接返回等于公开
- * 「谁赞过」,既是隐私面(能看出谁读了哪一页)又没有展示价值。只回计数与
- * 「我赞过没」,点赞按钮据此渲染。
+ * 独立点赞记录仅投影为计数与当前账号的点赞状态。
  */
 export function toClientJson(
   record: AnnotationRecord,
   actor: Author | null,
-): Omit<AnnotationRecord, 'likes' | 'requestId'> & { likeCount: number; likedByMe: boolean } {
-  const { likes, requestId, ...rest } = record;
+  likes: readonly number[],
+): Omit<AnnotationRecord, 'requestId'> & { likeCount: number; likedByMe: boolean } {
+  const { requestId, ...rest } = record;
   return {
     ...rest,
     likeCount: likes.length,
