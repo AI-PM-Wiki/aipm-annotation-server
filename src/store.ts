@@ -73,11 +73,14 @@ export interface AnnotationRecord {
    */
   target: { selectors: Selector[]; scope?: 'page' };
   replies: Reply[];
-  /** 点过赞的人的 GitHub 数字 id,升序无重复。对外只暴露计数与「我赞过没」,
-   *  见 annotations.ts 的 toClientJson —— 谁赞过是隐私面,也没有展示价值。 */
-  likes: number[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface LikeRecord {
+  id: string;
+  authorId: number;
+  likes: number[];
 }
 
 export interface SessionRecord {
@@ -109,9 +112,10 @@ export interface StoredState {
   annotations: AnnotationRecord[];
   sessions: SessionRecord[];
   operations: OperationRecord[];
+  likes: LikeRecord[];
 }
 
-const EMPTY_STATE: StoredState = { version: 1, annotations: [], sessions: [], operations: [] };
+const EMPTY_STATE: StoredState = { version: 1, annotations: [], sessions: [], operations: [], likes: [] };
 
 /** 单条批注的点赞数上限。存储文件可能被手工编辑,解析时不设上限就是给自己挖坑。 */
 const MAX_LIKES = 50_000;
@@ -136,6 +140,7 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
   const annotations: AnnotationRecord[] = [];
   const sessions: SessionRecord[] = [];
   const operations: OperationRecord[] = [];
+  const likes: LikeRecord[] = [];
   let dropped = 0;
 
   const rawAnnotations = Array.isArray(json.annotations) ? json.annotations : [];
@@ -143,6 +148,28 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
     const a = parseAnnotation(item);
     if (a === null) dropped++;
     else annotations.push(a);
+  }
+  if (json.likes !== undefined && !Array.isArray(json.likes)) throw new Error('点赞记录结构无效');
+  for (const item of (json.likes ?? []) as unknown[]) {
+    if (!isRecord(item) || typeof item.id !== 'string' || !item.id ||
+        !Number.isSafeInteger(item.authorId) || !Array.isArray(item.likes) ||
+        item.likes.length > MAX_LIKES || item.likes.some((id) => !Number.isSafeInteger(id)) ||
+        new Set(item.likes).size !== item.likes.length || likes.some((record) => record.id === item.id)) {
+      throw new Error('点赞记录损坏');
+    }
+    likes.push({ id: item.id, authorId: item.authorId as number, likes: item.likes as number[] });
+  }
+  for (const annotation of annotations) {
+    const existing = likes.find((record) => record.id === annotation.id);
+    if (existing !== undefined) {
+      if (existing.authorId !== annotation.author.githubId) throw new Error('点赞记录归属不一致');
+      continue;
+    }
+    if (json.likes !== undefined) throw new Error('批注缺少点赞记录');
+    const original = rawAnnotations.find((item) => isRecord(item) && item.id === annotation.id);
+    const users = isRecord(original) && Array.isArray(original.likes) ? original.likes : [];
+    likes.push({ id: annotation.id, authorId: annotation.author.githubId,
+      likes: [...new Set(users.filter((id): id is number => Number.isSafeInteger(id)))].slice(0, MAX_LIKES) });
   }
   const rawSessions = Array.isArray(json.sessions) ? json.sessions : [];
   for (const item of rawSessions) {
@@ -192,7 +219,7 @@ export function parseState(raw: string): { state: StoredState; dropped: number }
       visibility: null, createdAt: annotation.createdAt });
   }
 
-  return { state: { version: 1, annotations, sessions, operations }, dropped };
+  return { state: { version: 1, annotations, sessions, operations, likes }, dropped };
 }
 
 function parseAuthor(value: unknown): Author | null {
@@ -246,15 +273,6 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
   // 认不出的 style 一律回落 highlight(而不是丢整条记录):这是画法,不是内容
   const style: AnnotationStyle =
     value.style === 'underline' || value.style === 'both' ? value.style : 'highlight';
-  const likes: number[] = [];
-  if (Array.isArray(value.likes)) {
-    for (const item of value.likes) {
-      if (typeof item !== 'number' || !Number.isFinite(item)) continue;
-      if (likes.includes(item)) continue;
-      likes.push(item);
-      if (likes.length >= MAX_LIKES) break;
-    }
-  }
   const now = new Date(0).toISOString();
   return {
     id,
@@ -267,7 +285,6 @@ function parseAnnotation(value: unknown): AnnotationRecord | null {
     author,
     target: scope === undefined ? { selectors } : { selectors, scope },
     replies,
-    likes,
     createdAt: typeof createdAt === 'string' ? createdAt : now,
     updatedAt: typeof updatedAt === 'string' ? updatedAt : now,
   };
@@ -337,8 +354,8 @@ export class AnnotationStore {
       raw = await readFile(this.filePath, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        this.state = { version: 1, annotations: [], sessions: [], operations: [] };
-    this.persistedState = this.state;
+        this.state = { version: 1, annotations: [], sessions: [], operations: [], likes: [] };
+        this.persistedState = this.state;
         return { dropped: 0, annotations: 0, sessions: 0 };
       }
       throw err;
@@ -364,6 +381,20 @@ export class AnnotationStore {
 
   get operations(): OperationRecord[] {
     return this.state.operations;
+  }
+
+  getLikes(id: string): LikeRecord | undefined {
+    return this.state.likes.find((record) => record.id === id);
+  }
+
+  setLikes(record: LikeRecord): void {
+    this.state = { ...this.state, likes: [...this.state.likes.filter((item) => item.id !== record.id), record] };
+    this.markDirty();
+  }
+
+  removeLikes(id: string): void {
+    this.state = { ...this.state, likes: this.state.likes.filter((item) => item.id !== id) };
+    this.markDirty();
   }
 
   addAnnotationWithOperation(annotation: AnnotationRecord, operation?: OperationRecord): void {
