@@ -421,6 +421,22 @@ export class AnnotationStore {
     this.markDirty();
   }
 
+  refreshAuthor(author: Author): void {
+    this.state = { ...this.state,
+      annotations: this.state.annotations.map((annotation) => ({ ...annotation,
+        author: annotation.author.githubId === author.githubId ? { ...author } : annotation.author,
+        replies: annotation.replies.map((reply) => reply.author.githubId === author.githubId
+          ? { ...reply, author: { ...author } } : reply),
+      })),
+      sessions: this.state.sessions.map((session) => {
+        if (session.githubId !== author.githubId) return session;
+        const { login, name, avatarUrl, ...identity } = session;
+        return { ...identity, ...author };
+      }),
+    };
+    this.markDirty();
+  }
+
   private markDirty(): void {
     this.revision++;
   }

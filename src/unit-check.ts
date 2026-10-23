@@ -970,4 +970,68 @@ await test('real HTTP permission, identity, scope, idempotence and unavailable p
       await new Promise<void>((resolve, reject) => disabled.close(error => error ? reject(error) : resolve()));
     }
   });
+  await t.test('username changes refresh historical authors and existing sessions by GitHub ID', async () => {
+    const original: Author = { githubId: 8101, login: 'pRofile-Before', name: 'Profile Name',
+      avatarUrl: 'https://avatars.githubusercontent.com/u/8101' };
+    const firstToken = auth.issueSession(original);
+    const secondToken = auth.issueSession(original);
+    const unchangedToken = auth.issueSession({ githubId: 8102, login: original.login });
+    const ids: string[] = [];
+    for (const visibility of ['public', 'private']) {
+      const input = { ...payload, requestId: randomUUID(), visibility, body: 'Profile synchronization',
+        target: visibility === 'public' ? { scope: 'page', selectors: [] }
+          : { selectors: [{ type: 'TextQuoteSelector', exact: '检索' }] } };
+      const permit = await call('/api/annotation-permits', firstToken, 'POST', input);
+      assert.equal(permit.status, 201);
+      const created = await call('/api/annotations', firstToken, 'POST', input, permit.body.permit);
+      assert.equal(created.status, 201);
+      const id = created.body.annotation.id as string;
+      ids.push(id);
+      const reply = { annotationId: id, body: 'Profile reply' };
+      const replyPermit = await call('/api/reply-permits', secondToken, 'POST', reply);
+      assert.equal(replyPermit.status, 201);
+      assert.equal((await call(`/api/annotations/${id}/replies`, secondToken, 'POST',
+        { body: reply.body }, replyPermit.body.permit)).status, 201);
+      assert.equal((await call(`/api/annotations/${id}/like`, firstToken, 'PUT')).status, 200);
+    }
+    const before = store.annotations.filter(item => ids.includes(item.id));
+    const profile: Author = { githubId: original.githubId, login: 'Profile-After' };
+    const newToken = auth.issueSession(profile);
+    await store.flush();
+    for (const token of [firstToken, secondToken, newToken]) {
+      const me = await call('/api/auth/me', token);
+      assert.equal(me.status, 200);
+      assert.deepEqual(me.body.user, profile);
+    }
+    assert.equal((await call('/api/auth/me', unchangedToken)).body.user.login, original.login);
+    for (const annotation of before) {
+      const response = await call(`/api/annotations/${annotation.id}`, firstToken);
+      assert.equal(response.status, 200);
+      const current = response.body.annotation;
+      assert.deepEqual(current.author, profile);
+      assert.deepEqual(current.replies[0].author, profile);
+      assert.equal(current.createdAt, annotation.createdAt);
+      assert.equal(current.updatedAt, annotation.updatedAt);
+      assert.equal(current.replies[0].updatedAt, annotation.replies[0]!.updatedAt);
+      assert.equal(current.likeCount, 1);
+      assert.equal(current.likedByMe, true);
+      assert.equal((await call(`/api/annotations/${annotation.id}`, unchangedToken, 'PATCH',
+        { body: 'forbidden' })).status, annotation.visibility === 'private' ? 404 : 403);
+    }
+    const recased: Author = { ...profile, login: 'pROFILE-aFTER' };
+    const recasedToken = auth.issueSession(recased);
+    await store.flush();
+    for (const token of [firstToken, secondToken, newToken, recasedToken]) {
+      assert.deepEqual((await call('/api/auth/me', token)).body.user, recased);
+    }
+    assert.equal((await call('/api/auth/me', unchangedToken)).body.user.login, original.login);
+    const restarted = new AnnotationStore(dataDir);
+    await restarted.load();
+    const restartedAuth = new AuthService(config, restarted);
+    assert.deepEqual(restartedAuth.verify(firstToken), recased);
+    for (const annotation of restarted.annotations.filter(item => ids.includes(item.id))) {
+      assert.deepEqual(annotation.author, recased);
+      assert.deepEqual(annotation.replies[0]!.author, recased);
+    }
+  });
 });
